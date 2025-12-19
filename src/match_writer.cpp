@@ -5,23 +5,22 @@
 void writeMatchFile(
     const std::string& outPath,
     const Circuit& c1, const Circuit& c2,
-    const std::vector<std::pair<int,int>>& piPairs,
-    const std::vector<std::pair<int,int>>& poPairs
+    const MatchResult& res
 ) {
     std::ofstream fout(outPath.c_str());
     if (!fout) throw std::runtime_error("Cannot write match file: " + outPath);
 
     fout << "INGROUP\n";
-    for (auto& pr : piPairs) {
+    for (auto& pr : res.piPairs) {
         fout << "1 + " << c1.nets[pr.first].name << "\n";
         fout << "2 + " << c2.nets[pr.second].name << "\n";
     }
     fout << "END\n\n";
 
     fout << "OUTGROUP\n";
-    for (auto& pr : poPairs) {
-        fout << "1 + " << c1.nets[pr.first].name << "\n";
-        fout << "2 + " << c2.nets[pr.second].name << "\n";
+    for (auto& pr : res.poPairs) {
+        fout << "1 + " << c1.nets[pr.c1_po].name << "\n";
+        fout << "2 " << (pr.c2Neg ? '-' : '+') << " " << c2.nets[pr.c2_po].name << "\n";
     }
     fout << "END\n\n";
 

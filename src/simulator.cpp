@@ -70,6 +70,8 @@ static vector<uint64_t> makeConstTT(int blocks, bool one, int totalBits) {
     return v;
 }
 
+
+
 // ---- exported ----
 vector<TT> simulateCircuitTT(
     const Circuit& c,
@@ -78,9 +80,25 @@ vector<TT> simulateCircuitTT(
     const unordered_map<int,int>& piNetToAbstractIdx,
     const vector<int>& wantNets
 ) {
+    //------judge by number of PIs------
+    static const int MAX_ABS_PI  = 16;     // 推薦上限
+    static const int MAX_BLOCKS  = 4096;   // 額外保護（約等於 nAbsPI<=18）
+
     int nAbsPI = (int)piPatterns.size();
-    int total = 1 << nAbsPI;
-    int blocks = (total + 63) / 64;
+    if (nAbsPI > MAX_ABS_PI) {
+        // 你可以改成 throw / return 空 / 印錯誤都行
+        // 這裡用 return 空結果比較不會炸
+        return vector<TT>(wantNets.size(), TT());
+    }
+
+    // 用 uint64_t 防 overflow（避免 1<<nAbsPI 在 int 爆掉）
+    uint64_t total64 = 1ULL << nAbsPI;
+    int blocks = (int)((total64 + 63) / 64);
+    if (blocks > MAX_BLOCKS) {
+        return vector<TT>(wantNets.size(), TT());
+    }
+    int total = (int)total64; // nAbsPI<=16 時安全
+    // ---- judge by number of PIs ----
 
     vector<TT> netTT(c.nets.size());
     vector<char> hasTT(c.nets.size(), 0);

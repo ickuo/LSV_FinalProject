@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
             outPath = inputPath.substr(0, pos + 1) + outputName;
         }
 
-        writeMatchFile(outPath, c1, c2, res.piPairs, res.poPairs);
+        writeMatchFile(outPath, c1, c2, res);
 
         return 0;
 

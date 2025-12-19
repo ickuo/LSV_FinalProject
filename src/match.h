@@ -4,9 +4,18 @@
 #include <vector>
 #include <string>
 
+
+
 struct MatchResult {
     std::vector<std::pair<int,int>> piPairs; // (c1_pi, c2_pi)
-    std::vector<std::pair<int,int>> poPairs; // (c1_po, c2_po)
+    
+    struct OutPair {
+        int c1_po = -1;
+        int c2_po = -1;
+        bool c1Neg = false; // 先保留，但 writer 目前固定輸出 '+'
+        bool c2Neg = false; // true => OUTGROUP 會輸出 '-'
+    };
+    std::vector<OutPair> poPairs; // (c1_po, c2_po)
     bool success = false;
 };
 

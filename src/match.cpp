@@ -7,6 +7,49 @@
 
 using namespace std;
 
+// Invert a TT while keeping the padding bits (beyond totalBits) masked to 0.
+static TT invertTT(const TT& in, int totalBits) {
+    TT out = in;
+    for (auto& x : out) x = ~x;
+    int pad = ((int)out.size() * 64) - totalBits;
+    if (pad > 0 && !out.empty()) {
+        uint64_t keep = (~0ULL) >> pad;
+        out.back() &= keep;
+    }
+    return out;
+}
+//---------------------------
+
+static vector<vector<int>> buildGroups(
+    const Circuit& c,
+    const BusInfo& bi,
+    const vector<int>& busIds,
+    const vector<int>& netsOfInterest
+) {
+    vector<vector<int>> groups;
+    groups.reserve(busIds.size() + netsOfInterest.size());
+
+    vector<char> covered((int)c.nets.size(), 0);
+
+    // existing bus groups
+    for (int bid : busIds) {
+        const auto& mem = bi.buses[bid].members;
+        groups.push_back(mem);
+        for (int nid : mem) {
+            if (nid >= 0 && nid < (int)covered.size()) covered[nid] = 1;
+        }
+    }
+
+    // singleton groups for nets not in any bus
+    for (int nid : netsOfInterest) {
+        if (nid >= 0 && nid < (int)covered.size() && !covered[nid]) {
+            groups.push_back(vector<int>{nid});
+            covered[nid] = 1;
+        }
+    }
+    return groups;
+}
+
 static vector<int> filterBusIdsByType(const Circuit& c, const BusInfo& bi, bool wantPIbus, bool wantPObus) {
     vector<int> ids;
     for (const auto& b : bi.buses) {
@@ -21,11 +64,10 @@ static vector<int> filterBusIdsByType(const Circuit& c, const BusInfo& bi, bool 
     return ids;
 }
 
-static unordered_map<int, vector<int>> groupBusesBySize(const BusInfo& bi, const vector<int>& busIds) {
+static unordered_map<int, vector<int>> groupBusesBySize(const vector<vector<int>>& groups) {
     unordered_map<int, vector<int>> mp;
-    for (int id : busIds) {
-        int sz = (int)bi.buses[id].members.size();
-        mp[sz].push_back(id);
+    for (int gid = 0; gid < (int)groups.size(); gid++) {
+        mp[(int)groups[gid].size()].push_back(gid);
     }
     return mp;
 }
@@ -51,19 +93,25 @@ MatchResult solveByBusTT(
     vector<int> inBus2  = filterBusIdsByType(c2, b2, true,  false);
     vector<int> outBus2 = filterBusIdsByType(c2, b2, false, true);
 
-    auto in1  = groupBusesBySize(b1, inBus1);
-    auto in2  = groupBusesBySize(b2, inBus2);
-    auto out1 = groupBusesBySize(b1, outBus1);
-    auto out2 = groupBusesBySize(b2, outBus2);
+    auto inGroups1  = buildGroups(c1, b1, inBus1,  c1.PIs);
+    auto inGroups2  = buildGroups(c2, b2, inBus2,  c2.PIs);
+    auto outGroups1 = buildGroups(c1, b1, outBus1, c1.POs);
+    auto outGroups2 = buildGroups(c2, b2, outBus2, c2.POs);
+
+    auto in1  = groupBusesBySize(inGroups1);
+    auto in2  = groupBusesBySize(inGroups2);
+    auto out1 = groupBusesBySize(outGroups1);
+    auto out2 = groupBusesBySize(outGroups2);
+
 
     // sanity: same size categories exist
-    if (in1.size() != in2.size()) return best;
-    if (out1.size() != out2.size()) return best;
+    // if (in1.size() != in2.size()) return best;
+    // if (out1.size() != out2.size()) return best;
 
     // ---- decide abstract PI order = c1 PI buses in the order they appear in inBus1 ----
     vector<int> absPiNetsC1;
-    for (int bid : inBus1) {
-        for (int nid : b1.buses[bid].members) absPiNetsC1.push_back(nid);
+    for (const auto& g : inGroups1) {
+        for (int nid : g) absPiNetsC1.push_back(nid);
     }
 
     int nAbsPI = (int)absPiNetsC1.size();
@@ -89,7 +137,7 @@ MatchResult solveByBusTT(
     // ---- enumerate input bus bijection by size ----
     vector<int> inSizes = keysSorted(in1);
 
-    vector<pair<int,int>> chosenInBusPairs; // (busId1, busId2)
+    vector<pair<int,int>> chosenInBusPairs; // (groupId1, groupId2)
 
     function<bool(int)> dfsInputSize = [&](int si) -> bool {
         if (si == (int)inSizes.size()) {
@@ -100,8 +148,8 @@ MatchResult solveByBusTT(
             c1BusMembers.reserve(chosenInBusPairs.size());
             c2BusMembers.reserve(chosenInBusPairs.size());
             for (auto& bp : chosenInBusPairs) {
-                c1BusMembers.push_back(b1.buses[bp.first].members);
-                c2BusMembers.push_back(b2.buses[bp.second].members);
+                c1BusMembers.push_back(inGroups1[bp.first]);
+                c2BusMembers.push_back(inGroups2[bp.second]);
             }
 
             // build list of permutations for each c2 bus
@@ -137,7 +185,7 @@ MatchResult solveByBusTT(
 
                 // ---- enumerate output bus bijection + within-bus permutations, and test all PO pairs ----
                 vector<int> outSizes = keysSorted(out1);
-                vector<pair<int,int>> chosenOutBusPairs; // (busId1, busId2)
+                vector<pair<int,int>> chosenOutBusPairs; // (groupId1, groupId2)
 
                 function<bool(int)> dfsOutSize = [&](int osi) -> bool {
                     if (osi == (int)outSizes.size()) {
@@ -146,8 +194,8 @@ MatchResult solveByBusTT(
                         o1m.reserve(chosenOutBusPairs.size());
                         o2m.reserve(chosenOutBusPairs.size());
                         for (auto& bp : chosenOutBusPairs) {
-                            o1m.push_back(b1.buses[bp.first].members);
-                            o2m.push_back(b2.buses[bp.second].members);
+                            o1m.push_back(outGroups1[bp.first]);
+                            o2m.push_back(outGroups2[bp.second]);
                         }
 
                         vector<vector<vector<int>>> operms;
@@ -162,8 +210,11 @@ MatchResult solveByBusTT(
                         vector<int> oidx(operms.size(), 0);
                         while (true) {
                             bool ok = true;
-                            vector<pair<int,int>> poPairs;
+                            vector<MatchResult::OutPair> poPairs;
                             poPairs.reserve(c1.POs.size());
+
+                            // 這個 totalBits 是 2^nAbsPI
+                            const int totalBits = (int)piPatterns.size();
 
                             for (size_t k = 0; k < operms.size(); k++) {
                                 const auto& A = o1m[k];
@@ -171,11 +222,29 @@ MatchResult solveByBusTT(
                                 for (size_t t = 0; t < A.size(); t++) {
                                     int po1 = A[t];
                                     int po2 = B[t];
-                                    poPairs.push_back({po1, po2});
+                                    // poPairs.push_back({po1, po2});
 
                                     const TT& T1 = tt1_pos[c1PoIdx[po1]];
                                     const TT& T2 = tt2_pos[c2PoIdx[po2]];
-                                    if (!sameTT(T1, T2)) { ok = false; break; }
+                                    MatchResult::OutPair op;
+                                    op.c1_po = po1;
+                                    op.c2_po = po2;
+                                    op.c1Neg = false;
+                                    op.c2Neg = false;
+
+                                    if (sameTT(T1, T2)) {
+                                        op.c2Neg = false;
+                                    } else {
+                                        TT invT2 = invertTT(T2, totalBits);
+                                        if (sameTT(T1, invT2)) {
+                                            op.c2Neg = true;
+                                        } else {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+
+                                    poPairs.push_back(op);
                                 }
                                 if (!ok) break;
                             }
@@ -208,7 +277,7 @@ MatchResult solveByBusTT(
                     do {
                         int base = (int)chosenOutBusPairs.size();
                         for (size_t i = 0; i < L.size(); i++) {
-                            chosenOutBusPairs.push_back({L[i], R[i]});
+                            chosenOutBusPairs.push_back(std::make_pair(L[i], R[i]));
                         }
                         if (dfsOutSize(osi + 1)) return true;
                         chosenOutBusPairs.resize(base);
@@ -236,11 +305,12 @@ MatchResult solveByBusTT(
         int sz = inSizes[si];
 
         // need both sides have same number of buses for this size
-        auto itL = in1.find(sz), itR = in2.find(sz);
+        auto itL = in1.find(sz); 
+        auto itR = in2.find(sz);
         if (itL == in1.end() || itR == in2.end()) return false;
         const auto& L0 = itL->second;
         const auto& R0 = itR->second;
-        if (L0.size() != R0.size()) return false;
+        // if (L0.size() != R0.size()) return false;
 
         auto L = L0;
         auto R = R0;
@@ -249,7 +319,7 @@ MatchResult solveByBusTT(
         do {
             int base = (int)chosenInBusPairs.size();
             for (size_t i = 0; i < L.size(); i++) {
-                chosenInBusPairs.push_back({L[i], R[i]});
+                chosenInBusPairs.push_back(std::make_pair(L[i], R[i]));
             }
             if (dfsInputSize(si + 1)) return true;
             chosenInBusPairs.resize(base);
