@@ -19,4 +19,12 @@ std::vector<TT> simulateCircuitTT(
     const std::vector<int>& wantNets
 );
 
+// 一次跑 64 個 patterns：每個 net 的值用 uint64_t 表示
+std::vector<uint64_t> simulateCircuit64(
+    const Circuit& c,
+    const std::vector<int>& topo,
+    const std::vector<uint64_t>& piMaskByIndex, // size = c.PIs.size()
+    const std::vector<int>& wantNets            // e.g., c.POs
+);
+//MERRY XMAS HOHOHO!
 bool sameTT(const TT& a, const TT& b);

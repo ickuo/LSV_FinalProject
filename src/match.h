@@ -24,3 +24,13 @@ MatchResult solveByBusTT(
     const Circuit& c2, const BusInfo& b2,
     int maxPI = 16 // TT 上限
 );
+
+// Baseline PO-signature-based solver (random simulation)
+MatchResult solveByPOSignatureBaseline(
+    const Circuit& c1, const BusInfo& b1,
+    const Circuit& c2, const BusInfo& b2,
+    int batches,
+    int K,
+    int threshold
+);
+

@@ -24,8 +24,12 @@ int main(int argc, char** argv) {
 
         MatchResult res = solveByBusTT(c1, b1, c2, b2, 16);
         if (!res.success) {
-            std::cerr << "No mapping found.\n";
-            return 2;
+            // PI 太多或 bus TT 跑不動，就改用 signature baseline
+            std::cerr << "[DBG][Main] Using PO-signature solver\n";
+            res = solveByPOSignatureBaseline(c1, b1, c2, b2,
+                                     /*batches=*/16,
+                                     /*K=*/10,
+                                     /*threshold=*/120);
         }
 
         std::string inputPath  = argv[1];   // e.g. case01/input

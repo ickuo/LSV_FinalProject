@@ -1,5 +1,6 @@
 #include "simulator.h"
 #include <algorithm>
+#include <iostream>
 
 using namespace std;
 
@@ -181,3 +182,84 @@ bool sameTT(const TT& A, const TT& B) {
     for (size_t i = 0; i < A.size(); i++) if (A[i] != B[i]) return false;
     return true;
 }
+
+//-----------------------------
+//----- simulateCircuit64 -----
+//-----------------------------
+static inline uint64_t eval2(GateType t, uint64_t a, uint64_t b) {
+    switch (t) {
+        case GateType::AND:  return (a & b);
+        case GateType::OR:   return (a | b);
+        case GateType::NAND: return ~(a & b);
+        case GateType::NOR:  return ~(a | b);
+        case GateType::XOR:  return (a ^ b);
+        case GateType::XNOR: return ~(a ^ b);
+        default: return 0;
+    }
+}
+
+std::vector<uint64_t> simulateCircuit64(
+    const Circuit& c,
+    const std::vector<int>& topo,
+    const std::vector<uint64_t>& piMaskByIndex,
+    const std::vector<int>& wantNets
+) {
+    std::vector<uint64_t> netVal(c.nets.size(), 0);
+    std::vector<char> has(c.nets.size(), 0);
+
+    // const nets
+    for (auto& net : c.nets) {
+        if (net.isConst) {
+            netVal[net.id] = (net.constVal == 1) ? ~0ULL : 0ULL;
+            has[net.id] = 1;
+        }
+    }
+
+    // PI nets (依照 c.PIs 的 index 對應 piMaskByIndex)
+    for (size_t i = 0; i < c.PIs.size(); i++) {
+        int nid = c.PIs[i];
+        netVal[nid] = piMaskByIndex[i];
+        has[nid] = 1;
+    }
+
+    auto get = [&](int nid) -> uint64_t {
+        if (!has[nid]) { netVal[nid] = 0; has[nid] = 1; }
+        return netVal[nid];
+    };
+
+    for (int gid : topo) {
+        const Gate& g = c.gates[gid];
+        uint64_t out = 0;
+
+        if (g.type == GateType::BUF) {
+            out = get(g.inNets[0]);
+        } else if (g.type == GateType::NOT) {
+            out = ~get(g.inNets[0]);
+        } else {
+            uint64_t a = get(g.inNets[0]);
+            uint64_t b = get(g.inNets[1]);
+            out = eval2(g.type, a, b);
+        }
+
+        netVal[g.outNet] = out;
+        has[g.outNet] = 1;
+    }
+
+    //debug
+    static bool first = true;
+    if (first) {
+        first = false;
+        std::cerr << "[DBG][Sim64] wantNets size = " << wantNets.size() << "\n";
+        for (int i = 0; i < (int)wantNets.size() && i < 5; i++) {
+            std::cerr << "  PO net id=" << wantNets[i]
+                    << " name=" << c.nets[wantNets[i]].name << "\n";
+        }
+    }
+    //debug end
+
+    std::vector<uint64_t> res;
+    res.reserve(wantNets.size());
+    for (int nid : wantNets) res.push_back(get(nid));
+    return res;
+}
+
