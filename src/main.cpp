@@ -15,9 +15,16 @@ int main(int argc, char** argv) {
 
     try {
         ProblemInput pin = parseProblemInputFile(argv[1]);
+        auto simpName = [](const std::string& path) {
+            // 假設 input 是 .../circuit_1.v
+            if (path.size() >= 2 && path.substr(path.size() - 2) == ".v") {
+                return path.substr(0, path.size() - 2) + "_simp.v";
+            }
+            return path; // fallback
+        };
 
-        Circuit c1 = parseVerilogNetlist(pin.c1File);
-        Circuit c2 = parseVerilogNetlist(pin.c2File);
+        Circuit c1 = parseVerilogNetlist(simpName(pin.c1File));
+        Circuit c2 = parseVerilogNetlist(simpName(pin.c2File));
 
         BusInfo b1 = attachBuses(c1, pin.c1Buses);
         BusInfo b2 = attachBuses(c2, pin.c2Buses);

@@ -7,9 +7,299 @@
 #include <cctype>
 #include <stdexcept>
 #include <iterator>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_map>
 #include "parser.h"
 
 using namespace std;
+static inline string trim(const std::string& s);
+static std::string stripComments(const std::string& text);
+static std::vector<std::string> splitStatementsBySemicolon(const std::string& text);
+static std::vector<std::string> tokenize(const std::string& s);
+
+// ===================== ABC assign-only parser =====================
+
+namespace {
+
+enum class TokKind { ID, NOT, AND, OR, XOR, LP, RP, END };
+
+struct Tok { TokKind k; std::string s; };
+
+static bool isIdentChar(char c) {
+    return std::isalnum((unsigned char)c) || c=='_' || c=='\'' || c=='[' || c==']' || c=='.';
+}
+
+static std::vector<Tok> lexExpr(const std::string& expr) {
+    std::vector<Tok> v;
+    for (size_t i=0;i<expr.size();) {
+        char c = expr[i];
+        if (std::isspace((unsigned char)c)) { i++; continue; }
+        if (c=='~') { v.push_back({TokKind::NOT,"~"}); i++; continue; }
+        if (c=='&') { v.push_back({TokKind::AND,"&"}); i++; continue; }
+        if (c=='|') { v.push_back({TokKind::OR ,"|"}); i++; continue; }
+        if (c=='^') { v.push_back({TokKind::XOR,"^"}); i++; continue; }
+        if (c=='(') { v.push_back({TokKind::LP ,"("}); i++; continue; }
+        if (c==')') { v.push_back({TokKind::RP ,")"}); i++; continue; }
+
+        if (isIdentChar(c)) {
+            size_t j=i;
+            while (j<expr.size() && isIdentChar(expr[j])) j++;
+            v.push_back({TokKind::ID, expr.substr(i,j-i)});
+            i=j; continue;
+        }
+
+        // 不認得的字元：直接跳過或丟錯（建議丟錯比較早發現）
+        throw std::runtime_error("ABC expr lexer: unexpected char in: " + expr);
+    }
+    v.push_back({TokKind::END,""});
+    return v;
+}
+
+struct Node {
+    TokKind op;        // ID / NOT / AND / OR / XOR
+    std::string name;  // for ID
+    Node* a=nullptr;
+    Node* b=nullptr;
+};
+
+struct Parser {
+    std::vector<Tok> t;
+    size_t p=0;
+
+    Tok& peek() { return t[p]; }
+    Tok& get()  { return t[p++]; }
+
+    // grammar (precedence):
+    // expr := or
+    // or   := xor ( '|' xor )*
+    // xor  := and ( '^' and )*
+    // and  := unary ( '&' unary )*
+    // unary:= '~' unary | primary
+    // primary := ID | '(' expr ')'
+
+    Node* parseExpr() { return parseOr(); }
+
+    Node* parseOr() {
+        Node* lhs = parseXor();
+        while (peek().k == TokKind::OR) {
+            get();
+            Node* rhs = parseXor();
+            Node* n = new Node{TokKind::OR,"",lhs,rhs};
+            lhs = n;
+        }
+        return lhs;
+    }
+    Node* parseXor() {
+        Node* lhs = parseAnd();
+        while (peek().k == TokKind::XOR) {
+            get();
+            Node* rhs = parseAnd();
+            Node* n = new Node{TokKind::XOR,"",lhs,rhs};
+            lhs = n;
+        }
+        return lhs;
+    }
+    Node* parseAnd() {
+        Node* lhs = parseUnary();
+        while (peek().k == TokKind::AND) {
+            get();
+            Node* rhs = parseUnary();
+            Node* n = new Node{TokKind::AND,"",lhs,rhs};
+            lhs = n;
+        }
+        return lhs;
+    }
+    Node* parseUnary() {
+        if (peek().k == TokKind::NOT) {
+            get();
+            Node* x = parseUnary();
+            return new Node{TokKind::NOT,"",x,nullptr};
+        }
+        return parsePrimary();
+    }
+    Node* parsePrimary() {
+        if (peek().k == TokKind::ID) {
+            auto tk = get();
+            return new Node{TokKind::ID, tk.s, nullptr, nullptr};
+        }
+        if (peek().k == TokKind::LP) {
+            get();
+            Node* n = parseExpr();
+            if (peek().k != TokKind::RP) throw std::runtime_error("ABC expr parser: missing ')'");
+            get();
+            return n;
+        }
+        throw std::runtime_error("ABC expr parser: bad token near: " + peek().s);
+    }
+};
+
+static std::string trim2(const std::string& s) { return trim(s); }
+
+// 產生中繼 net 名稱（避免跟原本 new_nxx 撞名）
+static std::string freshTmpName(int& tmpCnt) {
+    tmpCnt++;
+    return "__tmp_" + std::to_string(tmpCnt);
+}
+
+// 將 AST 展開成 Gate / Net，回傳該 AST 對應的 net id
+static int emitAST(Circuit& c, Node* n, int& tmpCnt) {
+    if (n->op == TokKind::ID) {
+        return c.getNetId(n->name);
+    }
+
+    auto newGate = [&](GateType gt, int out, const std::vector<int>& ins) {
+        Gate g;
+        g.id = (int)c.gates.size();
+        g.type = gt;
+        g.instName = gateTypeToStr(gt) + std::string("_abc_") + std::to_string(g.id);
+        g.outNet = out;
+        g.inNets = ins;
+
+        c.nets[out].driverGate = g.id;
+        for (int inNet : ins) c.nets[inNet].sinkGates.push_back(g.id);
+
+        c.gates.push_back(std::move(g));
+    };
+
+    if (n->op == TokKind::NOT) {
+        int in = emitAST(c, n->a, tmpCnt);
+        std::string onm = freshTmpName(tmpCnt);
+        int out = c.getNetId(onm);
+        newGate(GateType::NOT, out, {in});
+        return out;
+    }
+
+    // binary
+    int a = emitAST(c, n->a, tmpCnt);
+    int b = emitAST(c, n->b, tmpCnt);
+    std::string onm = freshTmpName(tmpCnt);
+    int out = c.getNetId(onm);
+
+    if (n->op == TokKind::AND) newGate(GateType::AND, out, {a,b});
+    else if (n->op == TokKind::OR) newGate(GateType::OR, out, {a,b});
+    else if (n->op == TokKind::XOR) newGate(GateType::XOR, out, {a,b});
+    else throw std::runtime_error("emitAST: unsupported op");
+
+    return out;
+}
+
+static void freeAST(Node* n) {
+    if (!n) return;
+    freeAST(n->a);
+    freeAST(n->b);
+    delete n;
+}
+
+} // anonymous namespace
+
+
+void parseVerilogABC(const std::string& filename, Circuit& c) {
+    std::ifstream fin(filename);
+    if (!fin) throw std::runtime_error("Cannot open verilog file: " + filename);
+
+    std::string text((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    text = stripComments(text);
+    auto stmts = splitStatementsBySemicolon(text);
+
+    int tmpCnt = 0;
+
+    auto parseDeclListABC = [&](const std::vector<std::string>& tks, bool isInput, bool isOutput) {
+        for (size_t i=1;i<tks.size();i++) {
+            std::string nm = tks[i];
+            if (nm.empty()) continue;
+            int nid = c.getNetId(nm);
+            if (isInput && !c.nets[nid].isPI) {
+                c.nets[nid].isPI = true;
+                c.PIs.push_back(nid);
+            }
+            if (isOutput && !c.nets[nid].isPO) {
+                c.nets[nid].isPO = true;
+                c.POs.push_back(nid);
+            }
+        }
+    };
+
+    for (std::string st : stmts) {
+        st = trim2(st);
+        if (st.empty()) continue;
+
+        // module/input/output/wire/assign/endmodule
+        auto tks = tokenize(st);
+        if (tks.empty()) continue;
+
+        const std::string& head = tks[0];
+
+        if (head == "module") {
+            if (tks.size() >= 2) c.moduleName = tks[1];
+            continue;
+        }
+        if (head == "input") {
+            parseDeclListABC(tks, true, false);
+            continue;
+        }
+        if (head == "output") {
+            parseDeclListABC(tks, false, true);
+            continue;
+        }
+        if (head == "wire") {
+            for (size_t i=1;i<tks.size();i++) if (!tks[i].empty()) (void)c.getNetId(tks[i]);
+            continue;
+        }
+        if (head == "endmodule") continue;
+
+        if (head == "assign") {
+            // 原句型：assign <lhs> = <expr>
+            // tokenize() 會把 '=' 當成 token (它不是 delimiter) -> 你原 tokenize 不會拆 '='
+            // 所以這裡直接用字串找 '=' 比較穩
+            auto eqPos = st.find('=');
+            if (eqPos == std::string::npos) throw std::runtime_error("Bad assign: " + st);
+
+            std::string lhsPart = trim2(st.substr(6, eqPos - 6)); // after "assign"
+            std::string rhsPart = trim2(st.substr(eqPos + 1));
+
+            // lhsPart 可能還有空格
+            lhsPart = trim2(lhsPart);
+
+            int lhsNet = c.getNetId(lhsPart);
+
+            // 解析 rhs expr
+            auto toks = lexExpr(rhsPart);
+            Parser p; p.t = std::move(toks); p.p = 0;
+            Node* ast = p.parseExpr();
+            if (p.peek().k != TokKind::END) {
+                freeAST(ast);
+                throw std::runtime_error("Bad assign expr (trailing tokens): " + st);
+            }
+
+            int rhsNet = emitAST(c, ast, tmpCnt);
+            freeAST(ast);
+
+            // 最後把 rhsNet 接到 lhsNet：
+            // 用 BUF gate 表示 "lhs = rhs"
+            // （或你也可以直接把 lhsNet 當 emitAST 的 output，但那會讓多重 assign 更難處理）
+            {
+                Gate g;
+                g.id = (int)c.gates.size();
+                g.type = GateType::BUF;
+                g.instName = "buf_abc_" + std::to_string(g.id);
+                g.outNet = lhsNet;
+                g.inNets = {rhsNet};
+
+                c.nets[lhsNet].driverGate = g.id;
+                c.nets[rhsNet].sinkGates.push_back(g.id);
+
+                c.gates.push_back(std::move(g));
+            }
+
+            continue;
+        }
+
+        // 其他 statement 忽略
+    }
+}
 
 /*
   ============================================================
@@ -66,6 +356,20 @@ static string joinPath(const string& dir, const string& file) {
   Helpers: string processing
   ============================================================
 */
+
+bool looksLikeABCVerilog(const std::string& fileText) {
+    // ABC 常見特徵：大量 "assign "，幾乎沒有 and/or/xor gate inst lines
+    // 以及 header "written by ABC"
+    if (fileText.find("written by ABC") != std::string::npos) return true;
+    size_t nAssign = 0;
+    size_t pos = 0;
+    while ((pos = fileText.find("assign", pos)) != std::string::npos) {
+        nAssign++; pos += 6;
+        if (nAssign >= 3) return true;
+    }
+    return false;
+}
+
 
 static inline string trim(const string& s) {
     size_t i = 0, j = s.size();
@@ -213,9 +517,18 @@ Circuit parseVerilogNetlist(const string& path) {
     string text((istreambuf_iterator<char>(fin)), istreambuf_iterator<char>());
     text = stripComments(text);
     auto stmts = splitStatementsBySemicolon(text);
-
     Circuit cir;
     cir.path = path;
+
+    if (looksLikeABCVerilog(text)) {
+        parseVerilogABC(path, cir);
+        // optional de-dup PIs/POs
+        sort(cir.PIs.begin(), cir.PIs.end());
+        cir.PIs.erase(unique(cir.PIs.begin(), cir.PIs.end()), cir.PIs.end());
+        sort(cir.POs.begin(), cir.POs.end());
+        cir.POs.erase(unique(cir.POs.begin(), cir.POs.end()), cir.POs.end());
+        return cir;
+    }
 
     auto parseDeclList = [&](Circuit& c, const vector<string>& tks, bool isInput, bool isOutput) {
         // tks: ["input", "a0", "a1", ...] already tokenized by (), comma, whitespace

@@ -51,6 +51,10 @@ struct ProblemInput {
 };
 
 // ====== Parser APIs ======
+// 解析 ABC 輸出的 assign-only verilog
+void parseVerilogABC(const std::string& filename, Circuit& c);
+bool looksLikeABCVerilog(const std::string& fileText);
+
 ProblemInput parseProblemInputFile(const std::string& path);
 Circuit parseVerilogNetlist(const std::string& path);
 BusInfo attachBuses(const Circuit& c, const std::vector<std::vector<std::string>>& busNames);
