@@ -1,0 +1,8 @@
+# Equations for "top" written by ABC on Sat Dec 20 21:53:14 2025
+INORDER = a0 a1 b1 b0 c;
+OUTORDER = h0 h1 m0 m1;
+h0 = a0 * b0;
+h1 = (b1 * a0 * (!a1 + !b0)) + (a1 * b0 * (!b1 + !a0));
+m0 = (b1 * (!c + !b0)) + (c * b0 * !b1);
+m1 = (!c * b0) + (c * !b0);
+
