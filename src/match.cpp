@@ -8,9 +8,38 @@
 #include <vector>
 #include <limits>
 #include <algorithm>
+#include <unordered_set>
+#include <queue>
+
 
 using namespace std;
 
+namespace {
+
+// 64-bit hash function
+static inline uint64_t splitmix64(uint64_t& x) {
+    uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+// filter bus ids by type (PI bus / PO bus)
+static vector<int> filterBusIdsByType(const Circuit& c, const BusInfo& bi, bool wantPIbus, bool wantPObus) {
+    vector<int> ids;
+    for (const auto& b : bi.buses) {
+        bool allPI = true, allPO = true;
+        for (int nid : b.members) {
+            allPI = allPI && c.nets[nid].isPI;
+            allPO = allPO && c.nets[nid].isPO;
+        }
+        if (wantPIbus && allPI) ids.push_back(b.id);
+        else if (wantPObus && allPO) ids.push_back(b.id);
+    }
+    return ids;
+}
+
+// ============ Hungarian Algorithm ============
 static std::vector<int> hungarianMinCost(
     const std::vector<std::vector<double>>& cost)
 {
@@ -76,13 +105,565 @@ static std::vector<int> hungarianMinCost(
     return ans;
 }
 
+// ============ LocalHypothesis ============
 
-static inline uint64_t splitmix64(uint64_t& x) {
-    uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
+struct LocalHypothesis {
+    // pi2(net id in c2) -> pi1(net id in c1)
+    // -2 => CONST0, -3 => CONST1
+    std::unordered_map<int,int> map2to1;
+    std::vector<int> pis1_used;
+    std::vector<int> pis2_used;
+};
+
+// ============ cone / feature ============
+
+static std::unordered_set<int> collectFaninCone(
+    const Circuit& c, int startNet,
+    std::unordered_set<int>& pisUsed)
+{
+    std::unordered_set<int> cone;
+    std::queue<int> q;
+    q.push(startNet);
+    cone.insert(startNet);
+
+    while (!q.empty()) {
+        int net = q.front(); q.pop();
+        const Net& n = c.nets[net];
+
+        if (n.isPI) { pisUsed.insert(net); continue; }
+        if (n.isConst) continue;
+
+        int drv = n.driverGate;
+        if (drv < 0) continue;
+        const Gate& g = c.gates[drv];
+        for (int inNet : g.inNets) {
+            if (!cone.count(inNet)) {
+                cone.insert(inNet);
+                q.push(inNet);
+            }
+        }
+    }
+    return cone;
 }
+
+struct PIFeature { int occ = 0; int minDepth = 1e9; };
+
+static std::unordered_map<int,PIFeature> computePIFeaturesInCone(
+    const Circuit& c, int poNet,
+    const std::unordered_set<int>& coneNets,
+    const std::unordered_set<int>& conePIs)
+{
+    std::unordered_map<int,PIFeature> feat;
+    feat.reserve(conePIs.size() * 2);
+
+    // occ
+    for (int net : coneNets) {
+        const Net& n = c.nets[net];
+        if (n.isPI || n.isConst) continue;
+        int drv = n.driverGate;
+        if (drv < 0) continue;
+        const Gate& g = c.gates[drv];
+        for (int inNet : g.inNets) {
+            if (conePIs.count(inNet)) feat[inNet].occ++;
+        }
+    }
+
+    // minDepth: BFS from PO backward
+    std::queue<std::pair<int,int>> q;
+    std::unordered_map<int,int> best;
+    best.reserve(coneNets.size() * 2);
+
+    q.push({poNet, 0});
+    best[poNet] = 0;
+
+    while (!q.empty()) {
+        auto cur = q.front(); q.pop();
+        int net = cur.first, d = cur.second;
+
+        if (conePIs.count(net)) {
+            auto &f = feat[net];
+            f.minDepth = std::min(f.minDepth, d);
+            continue;
+        }
+
+        const Net& n = c.nets[net];
+        if (n.isConst) continue;
+
+        int drv = n.driverGate;
+        if (drv < 0) continue;
+        const Gate& g = c.gates[drv];
+
+        for (int inNet : g.inNets) {
+            if (!coneNets.count(inNet)) continue;
+            int nd = d + 1;
+            auto it = best.find(inNet);
+            if (it == best.end() || nd < it->second) {
+                best[inNet] = nd;
+                q.push({inNet, nd});
+            }
+        }
+    }
+
+    for (int pi : conePIs) {
+        if (!feat.count(pi)) feat[pi] = PIFeature{};
+        if (feat[pi].minDepth >= (int)1e9) feat[pi].minDepth = (int)1e9;
+    }
+    return feat;
+}
+
+// ============ bus-aware candidate selection ============
+
+// 收集 circuit 的 input buses (bus member nets are PI)
+static std::vector<int> getPIBusIds(const Circuit& c, const BusInfo& b) {
+    return filterBusIdsByType(c, b, /*wantPIbus=*/true, /*wantPObus=*/false);
+}
+
+// 建 netId -> PI busId (only for PI buses)
+static std::vector<int> buildNetToPIBusId(
+    const Circuit& c, const BusInfo& b,
+    const std::vector<int>& piBusIds)
+{
+    std::vector<int> net2bus((int)c.nets.size(), -1);
+    for (int bid : piBusIds) {
+        for (int nid : b.buses[bid].members) {
+            if (nid >= 0 && nid < (int)net2bus.size())
+                net2bus[nid] = bid;
+        }
+    }
+    return net2bus;
+}
+
+// 對某個 pi2，取得候選 pi1 列表：
+// 若 pi2 在某個 PI bus2 內 -> 候選優先取「size 相同」的 PI bus1 內所有 PI；
+// 若找不到 -> fallback 用 cone PIs1
+static std::vector<int> candidatePI1_for_pi2(
+    int pi2,
+    const std::unordered_set<int>& conePIs1,
+    const Circuit& c1, const BusInfo& b1,
+    const std::vector<int>& piBusIds1,
+    const std::vector<int>& net2piBus1,
+    const BusInfo& b2,
+    const std::vector<int>& net2piBus2)
+{
+    std::vector<int> cand;
+    int bid2 = (pi2 >= 0 && pi2 < (int)net2piBus2.size()) ? net2piBus2[pi2] : -1;
+    if (bid2 != -1) {
+        int sz2 = (int)b2.buses[bid2].members.size();
+
+        // 收集所有 size==sz2 的 PI buses in c1
+        for (int bid1 : piBusIds1) {
+            int sz1 = (int)b1.buses[bid1].members.size();
+            if (sz1 != sz2) continue;
+            for (int nid : b1.buses[bid1].members) {
+                if (nid >= 0 && nid < (int)c1.nets.size() && c1.nets[nid].isPI) {
+                    cand.push_back(nid);
+                }
+            }
+        }
+
+        // 如果 size match 的 bus1 都找不到，退回同 busId1（如果 pi2 的 bus size 很特別）
+        if (cand.empty()) {
+            // fallback: allow any PI bus1 members
+            for (int bid1 : piBusIds1) {
+                for (int nid : b1.buses[bid1].members) {
+                    if (nid >= 0 && nid < (int)c1.nets.size() && c1.nets[nid].isPI)
+                        cand.push_back(nid);
+                }
+            }
+        }
+    }
+
+    if (cand.empty()) {
+        // fallback: cone PIs1
+        cand.reserve(conePIs1.size());
+        for (int pi1 : conePIs1) cand.push_back(pi1);
+    }
+
+    // 去重
+    std::sort(cand.begin(), cand.end());
+    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+    return cand;
+}
+
+// ============ multi-hypothesis builder ============
+
+struct WeightCfg { int wDepth; int wOcc; };
+
+static std::vector<LocalHypothesis> buildLocalPIMappingHypothesesMulti(
+    const Circuit& c1, const BusInfo& b1,
+    const Circuit& c2, const BusInfo& b2,
+    int po1, int po2,
+    const std::vector<int>& piBusIds1,
+    const std::vector<int>& piBusIds2,
+    const std::vector<int>& net2piBus1,
+    const std::vector<int>& net2piBus2,
+    int L_max = 6)
+{
+    std::vector<LocalHypothesis> out;
+
+    // cones + PIs
+    std::unordered_set<int> pis1, pis2;
+    auto cone1 = collectFaninCone(c1, po1, pis1);
+    auto cone2 = collectFaninCone(c2, po2, pis2);
+
+    if (pis2.empty()) return out; // 沒有 PI2 用不到 mapping
+    if (pis1.empty()) {
+        // 極端：cone1 沒 PI，全部綁 CONST0 當一個 hypothesis
+        LocalHypothesis H;
+        H.pis1_used.assign(pis1.begin(), pis1.end());
+        H.pis2_used.assign(pis2.begin(), pis2.end());
+        for (int pi2 : pis2) H.map2to1[pi2] = -2;
+        out.push_back(std::move(H));
+        return out;
+    }
+
+    auto f1 = computePIFeaturesInCone(c1, po1, cone1, pis1);
+    auto f2 = computePIFeaturesInCone(c2, po2, cone2, pis2);
+
+    // 固定 ordering（讓 Hungarian matrix deterministic）
+    std::vector<int> P2(pis2.begin(), pis2.end());
+    std::sort(P2.begin(), P2.end());
+
+    // 多組權重 -> 多個 hypothesis
+    std::vector<WeightCfg> cfgs = {
+        {5, 1}, {10, 1}, {20, 1},
+        {5, 2}, {10, 2}, {20, 2}
+    };
+    if ((int)cfgs.size() > L_max) cfgs.resize(L_max);
+
+    // 用來去重：把 mapping 轉成 hash key
+    auto hashHyp = [&](const LocalHypothesis& H)->std::string{
+        std::vector<std::pair<int,int>> kv;
+        kv.reserve(H.map2to1.size());
+        for (auto &p : H.map2to1) kv.push_back(p);
+        std::sort(kv.begin(), kv.end());
+        std::string s;
+        s.reserve(kv.size() * 16);
+        for (auto &p : kv) {
+            s += std::to_string(p.first);
+            s += ":";
+            s += std::to_string(p.second);
+            s += ";";
+        }
+        return s;
+    };
+    std::unordered_set<std::string> seen;
+
+    for (auto cfg : cfgs) {
+        // 我們做 one-to-one assignment：rows = P2（pi2），cols = candidate pi1 pool
+        // 但每個 pi2 的候選集可能不同，所以我們取「聯集候選」當 col set，並用大 penalty 表示不可用
+        std::vector<std::vector<int>> candList;
+        candList.reserve(P2.size());
+
+        std::unordered_set<int> colSet;
+        for (int pi2 : P2) {
+            auto cand = candidatePI1_for_pi2(
+                pi2, pis1, c1, b1, piBusIds1, net2piBus1, b2, net2piBus2);
+            candList.push_back(cand);
+            for (int pi1 : cand) colSet.insert(pi1);
+        }
+
+        std::vector<int> P1(colSet.begin(), colSet.end());
+        std::sort(P1.begin(), P1.end());
+
+        int n = (int)P2.size();
+        int m = (int)P1.size();
+
+        // cost matrix n x m
+        const double INF = 1e9;
+        std::vector<std::vector<double>> cost(n, std::vector<double>(m, INF));
+
+        // 為了快速查 cand membership
+        std::vector<std::unordered_set<int>> candSet(n);
+        for (int i = 0; i < n; i++) {
+            candSet[i].reserve(candList[i].size() * 2);
+            for (int x : candList[i]) candSet[i].insert(x);
+        }
+
+        for (int i = 0; i < n; i++) {
+            int pi2 = P2[i];
+            const auto &a = f2[pi2];
+            for (int j = 0; j < m; j++) {
+                int pi1 = P1[j];
+                if (!candSet[i].count(pi1)) continue; // not allowed
+                const auto &b = f1[pi1];
+                double sc =
+                    (double)cfg.wDepth * std::abs(a.minDepth - b.minDepth) +
+                    (double)cfg.wOcc   * std::abs(a.occ - b.occ);
+                cost[i][j] = sc;
+            }
+        }
+
+        // Hungarian 要求方陣：若 m < n，補 dummy cols -> 代表 mapping 到 CONST0（先用 const）
+        // 你目前 hungarianMinCost 回傳 rows->col index，所以我們補齊到 size = max(n,m)
+        int dim = std::max(n, m);
+        std::vector<std::vector<double>> square(dim, std::vector<double>(dim, INF));
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < dim; j++) {
+                if (i < n && j < m) square[i][j] = cost[i][j];
+                else if (i < n && j >= m) {
+                    // dummy col: map to CONST0 with penalty
+                    square[i][j] = 10000.0; // 你可以調大/調小
+                } else {
+                    square[i][j] = 0.0;
+                }
+            }
+        }
+
+        std::vector<int> assign = hungarianMinCost(square);
+
+        LocalHypothesis H;
+        H.pis1_used.assign(pis1.begin(), pis1.end());
+        H.pis2_used.assign(pis2.begin(), pis2.end());
+
+        for (int i = 0; i < n; i++) {
+            int pi2 = P2[i];
+            int j = assign[i];
+            if (j < 0) { H.map2to1[pi2] = -2; continue; }
+
+            if (j < m) {
+                // map to real pi1
+                H.map2to1[pi2] = P1[j];
+            } else {
+                // dummy => CONST0
+                H.map2to1[pi2] = -2;
+            }
+        }
+
+        std::string key = hashHyp(H);
+        if (!seen.count(key)) {
+            seen.insert(key);
+            out.push_back(std::move(H));
+        }
+    }
+
+    return out;
+}
+
+// ------------- step 5 --------------
+static std::vector<int> getPINetsSorted(const Circuit& c) {
+    std::vector<int> pis = c.PIs;
+    std::sort(pis.begin(), pis.end());
+    return pis;
+}
+
+static std::vector<uint64_t> buildPI2MasksFromHyp(
+    const Circuit& c1, const Circuit& c2,
+    const std::vector<int>& piList1,           // sorted PI nets of c1
+    const std::vector<int>& piList2,           // sorted PI nets of c2
+    const std::vector<uint64_t>& piMasks1,     // same length as piList1
+    const LocalHypothesis& H,
+    uint64_t seed)
+{
+    // build map: pi1 net -> mask
+    std::unordered_map<int,uint64_t> pi1Mask;
+    pi1Mask.reserve(piList1.size()*2);
+    for (size_t i=0;i<piList1.size();i++) pi1Mask[piList1[i]] = piMasks1[i];
+
+    std::vector<uint64_t> piMasks2(piList2.size(), 0);
+    uint64_t s = seed;
+
+    int dbgShown = 0;
+
+    for (size_t i=0;i<piList2.size();i++) {
+        int pi2 = piList2[i];
+        auto it = H.map2to1.find(pi2);
+        if (it == H.map2to1.end()) {
+            // free PI2 -> random
+            piMasks2[i] = splitmix64(s);
+            continue;
+        }
+        int m = it->second;
+        if (m == -2) piMasks2[i] = 0ULL;          // CONST0
+        else if (m == -3) piMasks2[i] = ~0ULL;    // CONST1
+        else {
+            auto it1 = pi1Mask.find(m);
+            piMasks2[i] = (it1==pi1Mask.end()) ? splitmix64(s) : it1->second;
+        }
+        
+        // if (dbgShown++ < 12) {
+        //     std::cerr << "[DBG][HypAlign] pi2=" << c2.nets[pi2].name
+        //               << " i2=" << i
+        //               << " -> to=" << m;
+
+        //     if (m >= 0) std::cerr << " (" << c1.nets[m].name << ")";
+        //     else if (m == -2) std::cerr << " (CONST0)";
+        //     else if (m == -3) std::cerr << " (CONST1)";
+
+        //     std::cerr << "\n";
+        // }
+    }
+
+    return piMasks2;
+}
+
+static void debugCheckMaskAlignment(
+    const Circuit& c1, const Circuit& c2,
+    const std::vector<int>& piList1, const std::vector<int>& piList2,
+    const std::vector<uint64_t>& piMasks1,
+    const std::vector<uint64_t>& piMasks2,
+    const LocalHypothesis& H,
+    int maxCheck = 20,
+    bool abortOnMismatch = true)
+{
+    // netId -> index for quick locate
+    std::unordered_map<int,int> idx1, idx2;
+    idx1.reserve(piList1.size()*2);
+    idx2.reserve(piList2.size()*2);
+    for (int i = 0; i < (int)piList1.size(); i++) idx1[piList1[i]] = i;
+    for (int i = 0; i < (int)piList2.size(); i++) idx2[piList2[i]] = i;
+
+    int shown = 0;
+    int mismatch = 0;
+
+    for (auto &kv : H.map2to1) {
+        int pi2 = kv.first;
+        int m   = kv.second;
+
+        auto it2 = idx2.find(pi2);
+        if (it2 == idx2.end()) continue; // hypothesis 指到的 pi2 不是「全域 PI」，略過
+
+        int i2 = it2->second;
+        uint64_t got = piMasks2[i2];
+
+        uint64_t expect = 0;
+        bool hasExpect = true;
+
+        if (m == -2) { expect = 0ULL; }
+        else if (m == -3) { expect = ~0ULL; }
+        else {
+            auto it1 = idx1.find(m);
+            if (it1 == idx1.end()) {
+                // pi1 不在 piList1 => 你目前 buildPI2MasksFromHyp() 會用 random fallback
+                hasExpect = false;
+            } else {
+                expect = piMasks1[it1->second];
+            }
+        }
+
+        if (shown < maxCheck) {
+            std::cerr << "[DBG][AlignChk] pi2[" << i2 << "] "
+                      << c2.nets[pi2].name << " <- ";
+
+            if (m >= 0) std::cerr << "pi1 " << c1.nets[m].name;
+            else if (m == -2) std::cerr << "CONST0";
+            else if (m == -3) std::cerr << "CONST1";
+            else std::cerr << "???";
+
+            std::cerr << " | got=0x" << std::hex << got << std::dec;
+
+            if (hasExpect) {
+                std::cerr << " expect=0x" << std::hex << expect << std::dec;
+                std::cerr << " eq=" << (got == expect);
+            } else {
+                std::cerr << " expect=<FREE/RAND>";
+            }
+            std::cerr << "\n";
+            shown++;
+        }
+
+        if (hasExpect && got != expect) {
+            mismatch++;
+            if (abortOnMismatch) {
+                std::cerr << "[ERR][AlignChk] MASK MISMATCH: "
+                          << "pi2=" << c2.nets[pi2].name
+                          << " mapped-to=" << (m >= 0 ? c1.nets[m].name : (m==-2?"CONST0":"CONST1"))
+                          << "\n";
+                throw std::runtime_error("PI mask alignment mismatch (Step5 input order bug?)");
+            }
+        }
+    }
+
+    if (mismatch == 0) {
+        std::cerr << "[DBG][AlignChk] OK: all checked mapped PI masks aligned.\n";
+    } else {
+        std::cerr << "[DBG][AlignChk] mismatch count=" << mismatch << "\n";
+    }
+
+    // 也順手 dump 前幾個全域 PI 的 (index, name, mask) 讓你肉眼看位置是否一致
+    int lim1 = std::min<int>((int)piList1.size(), 12);
+    int lim2 = std::min<int>((int)piList2.size(), 12);
+    std::cerr << "[DBG][PIvecDump] C1 PI masks (first " << lim1 << ")\n";
+    for (int i=0;i<lim1;i++) {
+        int nid = piList1[i];
+        std::cerr << "  C1[" << i << "] " << c1.nets[nid].name
+                  << " mask=0x" << std::hex << piMasks1[i] << std::dec << "\n";
+    }
+    std::cerr << "[DBG][PIvecDump] C2 PI masks (first " << lim2 << ")\n";
+    for (int i=0;i<lim2;i++) {
+        int nid = piList2[i];
+        std::cerr << "  C2[" << i << "] " << c2.nets[nid].name
+                  << " mask=0x" << std::hex << piMasks2[i] << std::dec << "\n";
+    }
+}
+
+static bool quickVerifyHypothesisBySim64(
+    const Circuit& c1, const std::vector<int>& topo1,
+    const Circuit& c2, const std::vector<int>& topo2,
+    int po1, int po2, bool inv,
+    const LocalHypothesis& H,
+    int batches, uint64_t seedBase)
+{
+    const auto& piList1 = c1.PIs;  // 注意：用原順序
+    const auto& piList2 = c2.PIs;
+    // ----------debug----------
+    // static bool printed = false;
+    // if (!printed) {
+    //     printed = true;
+
+    //     auto dump = [&](const Circuit& c, const char* tag){
+    //         std::cerr << "[DBG][PIOrder] " << tag
+    //                 << " c.PIs.size=" << c.PIs.size() << "\n";
+    //         int lim = std::min<int>((int)c.PIs.size(), 30);
+    //         for (int i = 0; i < lim; i++) {
+    //             int nid = c.PIs[i];
+    //             std::cerr << "  [" << i << "] netId=" << nid
+    //                     << " name=" << c.nets[nid].name << "\n";
+    //         }
+    //     };
+
+    //     dump(c1, "C1");
+    //     dump(c2, "C2");
+    // }
+
+    // ----------debug end----------
+    for (int b=0;b<batches;b++) {
+        uint64_t s = seedBase + 0x9e3779b97f4a7c15ULL * (uint64_t)b;
+
+        // PI1 random masks
+        std::vector<uint64_t> piMasks1(piList1.size());
+        for (size_t i=0;i<piMasks1.size();i++) piMasks1[i] = splitmix64(s);
+
+        // PI2 masks from hypothesis
+        auto piMasks2 = buildPI2MasksFromHyp(c1, c2, piList1, piList2, piMasks1, H, s);
+        // --- debug : Step5 input alignment check (only do for first few batches to avoid spam) ---
+        if (b == 0) {
+            debugCheckMaskAlignment(
+                c1, c2,
+                piList1, piList2,
+                piMasks1, piMasks2,
+                H,
+                /*maxCheck=*/20,
+                /*abortOnMismatch=*/true
+            );
+        }
+
+        // simulate just one PO each side
+        std::vector<int> poVec1 = {po1};
+        std::vector<int> poVec2 = {po2};
+        auto out1 = simulateCircuit64(c1, topo1, piMasks1, poVec1);
+        auto out2 = simulateCircuit64(c2, topo2, piMasks2, poVec2);
+        uint64_t y1 = out1[0];
+        uint64_t y2 = out2[0];
+        if (inv) y2 = ~y2;
+
+        if (y1 != y2) return false; // counterexample found
+    }
+    return true; // survived all batches (not proof, but strong filter)
+}
+
+} // namespace
+
 
 
 // Invert a TT while keeping the padding bits (beyond totalBits) masked to 0.
@@ -128,19 +709,7 @@ static vector<vector<int>> buildGroups(
     return groups;
 }
 
-static vector<int> filterBusIdsByType(const Circuit& c, const BusInfo& bi, bool wantPIbus, bool wantPObus) {
-    vector<int> ids;
-    for (const auto& b : bi.buses) {
-        bool allPI = true, allPO = true;
-        for (int nid : b.members) {
-            allPI = allPI && c.nets[nid].isPI;
-            allPO = allPO && c.nets[nid].isPO;
-        }
-        if (wantPIbus && allPI) ids.push_back(b.id);
-        else if (wantPObus && allPO) ids.push_back(b.id);
-    }
-    return ids;
-}
+
 
 static unordered_map<int, vector<int>> groupBusesBySize(const vector<vector<int>>& groups) {
     unordered_map<int, vector<int>> mp;
@@ -454,15 +1023,15 @@ static POSig buildPOSignature(const Circuit& c, const std::vector<int>& topo,
     }
 
     // debug
-    std::cerr << "[DBG][Sig] batches=" << batches
-              << " PO count=" << out.ones.size()
-              << " siglen=" << (out.ones.empty() ? 0 : out.ones[0].size())
-              << "\n";
-    for (int i = 0; i < (int)out.ones.size() && i < 3; i++) {
-        std::cerr << "  PO[" << i << "] ones: ";
-        for (auto v : out.ones[i]) std::cerr << (int)v << " ";
-        std::cerr << "\n";
-    }
+    // std::cerr << "[DBG][Sig] batches=" << batches
+    //           << " PO count=" << out.ones.size()
+    //           << " siglen=" << (out.ones.empty() ? 0 : out.ones[0].size())
+    //           << "\n";
+    // for (int i = 0; i < (int)out.ones.size() && i < 3; i++) {
+    //     std::cerr << "  PO[" << i << "] ones: ";
+    //     for (auto v : out.ones[i]) std::cerr << (int)v << " ";
+    //     std::cerr << "\n";
+    // }
     // debug end
 
     return out;
@@ -519,36 +1088,36 @@ buildPOCandidates(const Circuit& c1, const POSig& s1,
         cands[i] = std::move(tmp);
 
         // debug only for first po1
-        if (i == 0) {
-            std::cerr << "[DBG][POCand] po1=" << c1.nets[c1.POs[i]].name << "\n";
-            std::cerr << "  bestSame=" << bestSame
-                      << " with po2=" << (bestJ_same>=0 ? c2.nets[c2.POs[bestJ_same]].name : "NA") << "\n";
-            std::cerr << "  bestInv =" << bestInv
-                      << " with po2=" << (bestJ_inv>=0 ? c2.nets[c2.POs[bestJ_inv]].name : "NA") << "\n";
-            std::cerr << "  bestMin =" << bestMin
-                      << " inv=" << bestMinInv
-                      << " with po2=" << (bestJ_min>=0 ? c2.nets[c2.POs[bestJ_min]].name : "NA") << "\n";
-            std::cerr << "  candidates kept=" << cands[i].size() << "\n";
-        }
-        if (i == 0) {
-            std::cerr << "[DBG][POCand-ALL] po1="
-                    << c1.nets[c1.POs[i]].name << "\n";
+        // if (i == 0) {
+        //     std::cerr << "[DBG][POCand] po1=" << c1.nets[c1.POs[i]].name << "\n";
+        //     std::cerr << "  bestSame=" << bestSame
+        //               << " with po2=" << (bestJ_same>=0 ? c2.nets[c2.POs[bestJ_same]].name : "NA") << "\n";
+        //     std::cerr << "  bestInv =" << bestInv
+        //               << " with po2=" << (bestJ_inv>=0 ? c2.nets[c2.POs[bestJ_inv]].name : "NA") << "\n";
+        //     std::cerr << "  bestMin =" << bestMin
+        //               << " inv=" << bestMinInv
+        //               << " with po2=" << (bestJ_min>=0 ? c2.nets[c2.POs[bestJ_min]].name : "NA") << "\n";
+        //     std::cerr << "  candidates kept=" << cands[i].size() << "\n";
+        // }
+        // if (i == 0) {
+        //     std::cerr << "[DBG][POCand-ALL] po1="
+        //             << c1.nets[c1.POs[i]].name << "\n";
 
-            for (size_t j = 0; j < c2.POs.size(); j++) {
-                int dSame, dInv;
-                distancePO_pvec(s1.ones[i], s2.ones[j], dSame, dInv);
-                int best = std::min(dSame, dInv);
-                bool inv = (dInv < dSame);
+        //     for (size_t j = 0; j < c2.POs.size(); j++) {
+        //         int dSame, dInv;
+        //         distancePO_pvec(s1.ones[i], s2.ones[j], dSame, dInv);
+        //         int best = std::min(dSame, dInv);
+        //         bool inv = (dInv < dSame);
 
-                std::cerr << "  po2="
-                        << c2.nets[c2.POs[j]].name
-                        << "  dSame=" << dSame
-                        << "  dInv=" << dInv
-                        << "  best=" << best
-                        << "  inv=" << inv
-                        << "\n";
-            }
-        }
+        //         std::cerr << "  po2="
+        //                 << c2.nets[c2.POs[j]].name
+        //                 << "  dSame=" << dSame
+        //                 << "  dInv=" << dInv
+        //                 << "  best=" << best
+        //                 << "  inv=" << inv
+        //                 << "\n";
+        //     }
+        // }
         // debug end
     }
 
@@ -651,6 +1220,19 @@ MatchResult solveByPOSignatureBaseline(
         inv = (invMat[i][j] != 0);
         return score[i][j];
     };
+
+    // --- precompute PI bus ids + net->PIbusId for bus-aware Step4 ---
+    auto piBusIds1_all = getPIBusIds(c1, b1);
+    auto piBusIds2_all = getPIBusIds(c2, b2);
+
+    std::vector<int> piBusIds1, piBusIds2;
+    for (int bid : piBusIds1_all)
+        if ((int)b1.buses[bid].members.size() >= 2) piBusIds1.push_back(bid);
+    for (int bid : piBusIds2_all)
+        if ((int)b2.buses[bid].members.size() >= 2) piBusIds2.push_back(bid);
+
+    std::vector<int> net2piBus1 = buildNetToPIBusId(c1, b1, piBusIds1);
+    std::vector<int> net2piBus2 = buildNetToPIBusId(c2, b2, piBusIds2);
 
 
     // 1) 建立 PO bus-only groups（size>=2），singleton 不要進 bus-level Hungarian
@@ -832,41 +1414,108 @@ MatchResult solveByPOSignatureBaseline(
             used2[bestJ] = 1;
         }
     }
+    // Step4: build local hypothesis for each selected PO pair (for debug / for next step)
+    // std::vector<LocalHypothesis> hyps;
+    // hyps.reserve(res.poPairs.size());
 
-    res.success = !res.poPairs.empty();
-    cerr << "\n========== DEBUG: res.poPairs (with ones distance) ==========\n";
+    cerr << "\n========== DEBUG: Step4+5a (build hyps then quick-verify) ==========\n";
 
+    int pairLimit   = 10;   // debug 印前幾個
+    int hypLimit    = 6;
+    int simBatches  = 8;
+
+    std::unordered_map<int, LocalHypothesis> chosenHypByPo1; // po1 -> chosen hypothesis
+    chosenHypByPo1.reserve(pairLimit * 2);
+
+    int cnt = 0;
     for (const auto& pp : res.poPairs) {
-        int net1 = pp.c1_po;      // net id in c1
-        int net2 = pp.c2_po;      // net id in c2 (no sign here, you store sign separately)
-        bool invChosen = pp.c2Neg;
+        if (cnt++ >= pairLimit) break;
 
-        // 防呆
-        if (net1 < 0 || net1 >= (int)c1.nets.size()) continue;
-        if (net2 < 0 || net2 >= (int)c2.nets.size()) continue;
+        auto hyps = buildLocalPIMappingHypothesesMulti(
+            c1, b1, c2, b2,
+            pp.c1_po, pp.c2_po,
+            piBusIds1, piBusIds2,
+            net2piBus1, net2piBus2,
+            hypLimit
+        );
 
-        // 轉成 PO index（給 sig.ones 用）
-        auto it1 = poIdx1.find(net1);
-        auto it2 = poIdx2.find(net2);
-        if (it1 == poIdx1.end() || it2 == poIdx2.end()) continue;
+        cerr << "[POpair] " << c1.nets[pp.c1_po].name
+            << " <-> " << (pp.c2Neg ? "-" : "+") << c2.nets[pp.c2_po].name
+            << " | #hyps=" << hyps.size() << "\n";
 
-        int i = it1->second;
-        int j = it2->second;
+        bool anyPass = false;
 
-        int dSame, dInv;
-        distancePO_pvec(sig1.ones[i], sig2.ones[j], dSame, dInv);
+        for (int h = 0; h < (int)hyps.size(); h++) {
+            // (可選) 先印 hypothesis 前幾條 mapping
+            if (h == 0) {
+                int shown = 0;
+                for (auto& kv : hyps[h].map2to1) {
+                    if (shown++ >= 10) break;
+                    int pi2 = kv.first, pi1 = kv.second;
+                    cerr << "    2 " << c2.nets[pi2].name << " -> "
+                        << (pi1 == -2 ? "CONST0" : (pi1 == -3 ? "CONST1" : c1.nets[pi1].name))
+                        << "\n";
+                }
+            }
 
-        cerr << "C1_PO " << c1.nets[net1].name
-            << " <-> C2_PO "
-            << (invChosen ? "-" : "+")
-            << c2.nets[net2].name
-            << " | dSame=" << dSame
-            << " dInv=" << dInv
-            << " | chosen=" << (invChosen ? "INV" : "SAME")
-            << "\n";
+            bool ok = quickVerifyHypothesisBySim64(
+                c1, topo1, c2, topo2,
+                pp.c1_po, pp.c2_po, pp.c2Neg,
+                hyps[h],
+                simBatches,
+                1234567ULL + 99991ULL * (uint64_t)h
+            );
+
+            cerr << "  [Step5a] H" << h << " => " << (ok ? "PASS" : "FAIL") << "\n";
+
+            if (ok) {
+                anyPass = true;
+                chosenHypByPo1[pp.c1_po] = hyps[h]; // ✅ 把通過的存起來，給 Step5b 用
+                break;
+            }
+        }
+
+        if (!anyPass) {
+            cerr << "  => ALL hyps failed (likely wrong PO pair or Step4 too weak)\n";
+        }
     }
 
-    cerr << "============================================================\n\n";
+    cerr << "============================================================\n";
+
+    res.success = !res.poPairs.empty();
+    // cerr << "\n========== DEBUG: res.poPairs (with ones distance) ==========\n";
+
+    // for (const auto& pp : res.poPairs) {
+    //     int net1 = pp.c1_po;      // net id in c1
+    //     int net2 = pp.c2_po;      // net id in c2 (no sign here, you store sign separately)
+    //     bool invChosen = pp.c2Neg;
+
+    //     // 防呆
+    //     if (net1 < 0 || net1 >= (int)c1.nets.size()) continue;
+    //     if (net2 < 0 || net2 >= (int)c2.nets.size()) continue;
+
+    //     // 轉成 PO index（給 sig.ones 用）
+    //     auto it1 = poIdx1.find(net1);
+    //     auto it2 = poIdx2.find(net2);
+    //     if (it1 == poIdx1.end() || it2 == poIdx2.end()) continue;
+
+    //     int i = it1->second;
+    //     int j = it2->second;
+
+    //     int dSame, dInv;
+    //     distancePO_pvec(sig1.ones[i], sig2.ones[j], dSame, dInv);
+
+    //     cerr << "C1_PO " << c1.nets[net1].name
+    //         << " <-> C2_PO "
+    //         << (invChosen ? "-" : "+")
+    //         << c2.nets[net2].name
+    //         << " | dSame=" << dSame
+    //         << " dInv=" << dInv
+    //         << " | chosen=" << (invChosen ? "INV" : "SAME")
+    //         << "\n";
+    // }
+
+    // cerr << "============================================================\n\n";
 
 
     return res;

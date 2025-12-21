@@ -1,6 +1,7 @@
 #include "simulator.h"
 #include <algorithm>
 #include <iostream>
+#include <unordered_set>
 
 using namespace std;
 
@@ -221,6 +222,24 @@ std::vector<uint64_t> simulateCircuit64(
         netVal[nid] = piMaskByIndex[i];
         has[nid] = 1;
     }
+    // ===== DEBUG: confirm PI order & mask mapping (print once per Circuit*) =====
+    // static std::unordered_set<const Circuit*> printed;
+    // if (!printed.count(&c)) {
+    //     printed.insert(&c);
+
+    //     std::cerr << "[DBG][Sim64] PI assignment uses c.PIs order | Circuit*=" << &c
+    //             << " PIs=" << c.PIs.size() << " wantNets=" << wantNets.size() << "\n";
+
+    //     int lim = (int)c.PIs.size();//std::min<int>(, 10);
+    //     for (int i = 0; i < lim; i++) {
+    //         int nid = c.PIs[i];
+    //         std::cerr << "  PI[" << i << "] netId=" << nid
+    //                 << " name=" << c.nets[nid].name
+    //                 << " mask=0x" << std::hex << piMaskByIndex[i] << std::dec
+    //                 << "\n";
+    //     }
+    // }
+    // ==============================================================
 
     auto get = [&](int nid) -> uint64_t {
         if (!has[nid]) { netVal[nid] = 0; has[nid] = 1; }
