@@ -1,1522 +1,1716 @@
 #include "match.h"
+
+#include "parser.h"
+#include "sat_check.h"
 #include "simulator.h"
+#include "unate_table.h"
+
 #include <algorithm>
-#include <unordered_map>
-#include <stdexcept>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <fstream>
 #include <functional>
 #include <iostream>
-#include <vector>
-#include <limits>
-#include <algorithm>
+#include <random>
+#include <sstream>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
-#include <queue>
-
-
-using namespace std;
+#include <utility>
+#include <vector>
 
 namespace {
 
-// 64-bit hash function
-static inline uint64_t splitmix64(uint64_t& x) {
-    uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
+using std::string;
+using std::vector;
+
+// ------------------------
+// Unate helpers
+// ------------------------
+static inline char normRel(char c) {
+    switch (c) {
+        case 'P': case 'N': case 'B': case 'I': return c;
+        default: return 'I';
+    }
+}
+static inline char redRel(char c) {
+    c = normRel(c);
+    if (c == 'P' || c == 'N') return 'U';
+    return c; // B or I
 }
 
-// filter bus ids by type (PI bus / PO bus)
-static vector<int> filterBusIdsByType(const Circuit& c, const BusInfo& bi, bool wantPIbus, bool wantPObus) {
-    vector<int> ids;
-    for (const auto& b : bi.buses) {
-        bool allPI = true, allPO = true;
-        for (int nid : b.members) {
-            allPI = allPI && c.nets[nid].isPI;
-            allPO = allPO && c.nets[nid].isPO;
-        }
-        if (wantPIbus && allPI) ids.push_back(b.id);
-        else if (wantPObus && allPO) ids.push_back(b.id);
-    }
-    return ids;
-}
-
-// ============ Hungarian Algorithm ============
-static std::vector<int> hungarianMinCost(
-    const std::vector<std::vector<double>>& cost)
-{
-    int n = cost.size();
-    int m = n ? cost[0].size() : 0;
-    if (n == 0 || m == 0) return {};
-
-    bool transposed = false;
-    std::vector<std::vector<double>> a = cost;
-    if (n > m) {
-        transposed = true;
-        std::vector<std::vector<double>> b(m, std::vector<double>(n));
-        for (int i = 0; i < n; i++)
-            for (int j = 0; j < m; j++)
-                b[j][i] = a[i][j];
-        a.swap(b);
-        std::swap(n, m);
-    }
-
-    const double INF = std::numeric_limits<double>::infinity();
-    std::vector<double> u(n+1), v(m+1);
-    std::vector<int> p(m+1), way(m+1);
-
-    for (int i = 1; i <= n; i++) {
-        p[0] = i;
-        int j0 = 0;
-        std::vector<double> minv(m+1, INF);
-        std::vector<char> used(m+1, false);
-        do {
-            used[j0] = true;
-            int i0 = p[j0];
-            double delta = INF;
-            int j1 = 0;
-            for (int j = 1; j <= m; j++) if (!used[j]) {
-                double cur = a[i0-1][j-1] - u[i0] - v[j];
-                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
-                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
-            }
-            for (int j = 0; j <= m; j++) {
-                if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
-                else minv[j] -= delta;
-            }
-            j0 = j1;
-        } while (p[j0] != 0);
-
-        do {
-            int j1 = way[j0];
-            p[j0] = p[j1];
-            j0 = j1;
-        } while (j0);
-    }
-
-    std::vector<int> rowToCol(n, -1);
-    for (int j = 1; j <= m; j++)
-        if (p[j]) rowToCol[p[j]-1] = j-1;
-
-    if (!transposed) return rowToCol;
-
-    std::vector<int> ans(cost.size(), -1);
-    for (int j = 0; j < (int)rowToCol.size(); j++)
-        if (rowToCol[j] >= 0)
-            ans[rowToCol[j]] = j;
-    return ans;
-}
-
-// ============ LocalHypothesis ============
-
-struct LocalHypothesis {
-    // pi2(net id in c2) -> pi1(net id in c1)
-    // -2 => CONST0, -3 => CONST1
-    std::unordered_map<int,int> map2to1;
-    std::vector<int> pis1_used;
-    std::vector<int> pis2_used;
+// ------------------------
+// Row feature (used for PO candidate ranking)
+// ------------------------
+struct RowFeat {
+    int minPN = 0;
+    int maxPN = 0;
+    int cntB  = 0;
+    int cntI  = 0;
+    std::string refKey;
 };
 
-// ============ cone / feature ============
+static RowFeat makeRowFeat(const UnateTable& t, int poIdx) {
+    RowFeat f;
+    int cntP = 0, cntN = 0;
+    for (int j = 0; j < t.nPI; j++) {
+        char a = normRel(t.rel[poIdx][j]);
+        if (a == 'P') cntP++;
+        else if (a == 'N') cntN++;
+        else if (a == 'B') f.cntB++;
+        else f.cntI++;
+    }
+    f.minPN = std::min(cntP, cntN);
+    f.maxPN = std::max(cntP, cntN);
+    return f;
+}
 
-static std::unordered_set<int> collectFaninCone(
-    const Circuit& c, int startNet,
-    std::unordered_set<int>& pisUsed)
-{
-    std::unordered_set<int> cone;
-    std::queue<int> q;
-    q.push(startNet);
-    cone.insert(startNet);
+static inline int rowFeatDistL1(const RowFeat& a, const RowFeat& b) {
+    return std::abs(a.minPN - b.minPN) + std::abs(a.maxPN - b.maxPN) +
+           std::abs(a.cntB  - b.cntB)  + std::abs(a.cntI  - b.cntI);
+}
 
-    while (!q.empty()) {
-        int net = q.front(); q.pop();
-        const Net& n = c.nets[net];
+static inline std::string colReducedKey(const UnateTable& t, int piIdx) {
+    int cntU = 0, cntB = 0, cntI = 0;
+    for (int po = 0; po < t.nPO; po++) {
+        char r = redRel(t.rel[po][piIdx]);
+        if (r == 'U') cntU++;
+        else if (r == 'B') cntB++;
+        else cntI++;
+    }
+    return std::to_string(cntU) + "," + std::to_string(cntB) + "," + std::to_string(cntI);
+}
 
-        if (n.isPI) { pisUsed.insert(net); continue; }
-        if (n.isConst) continue;
+static inline std::vector<std::string> computeColReducedKeys(const UnateTable& t) {
+    std::vector<std::string> keys(t.nPI);
+    for (int pi = 0; pi < t.nPI; pi++) keys[pi] = colReducedKey(t, pi);
+    return keys;
+}
 
-        int drv = n.driverGate;
-        if (drv < 0) continue;
-        const Gate& g = c.gates[drv];
-        for (int inNet : g.inNets) {
-            if (!cone.count(inNet)) {
-                cone.insert(inNet);
-                q.push(inNet);
+static inline std::string makeRowRefKey(const UnateTable& t,
+                                        int poIdx,
+                                        const std::vector<std::string>& colKeys,
+                                        const RowFeat& base) {
+    std::unordered_map<std::string, std::array<int,3>> hist;
+    hist.reserve((size_t)t.nPI * 2);
+
+    for (int pi = 0; pi < t.nPI; pi++) {
+        const std::string& ck = colKeys[pi];
+        char r = redRel(t.rel[poIdx][pi]);
+        int idx = (r == 'U') ? 0 : (r == 'B' ? 1 : 2);
+        auto it = hist.find(ck);
+        if (it == hist.end()) it = hist.emplace(ck, std::array<int,3>{0,0,0}).first;
+        it->second[idx]++;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(hist.size());
+    for (const auto& kv : hist) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+
+    std::ostringstream oss;
+    oss << base.minPN << "/" << base.maxPN << "|" << base.cntB << "|" << base.cntI << "|";
+    for (const auto& k : keys) {
+        const auto& a = hist[k];
+        oss << k << ":" << a[0] << "," << a[1] << "," << a[2] << ";";
+    }
+    return oss.str();
+}
+
+// ------------------------
+// Hopcroft-Karp (perfect matching on L)
+// ------------------------
+static bool hopcroftKarp(const vector<vector<int>>& adj, int nR, vector<int>& matchL) {
+    const int nL = (int)adj.size();
+    vector<int> matchR(nR, -1);
+    matchL.assign(nL, -1);
+
+    vector<int> dist(nL);
+    auto bfs = [&]() -> bool {
+        vector<int> q;
+        q.reserve(nL);
+        for (int u = 0; u < nL; u++) {
+            if (matchL[u] == -1) { dist[u] = 0; q.push_back(u); }
+            else dist[u] = -1;
+        }
+        bool foundAug = false;
+        for (size_t qi = 0; qi < q.size(); qi++) {
+            int u = q[qi];
+            for (int v : adj[u]) {
+                int u2 = matchR[v];
+                if (u2 >= 0 && dist[u2] == -1) {
+                    dist[u2] = dist[u] + 1;
+                    q.push_back(u2);
+                }
+                if (u2 == -1) foundAug = true;
+            }
+        }
+        return foundAug;
+    };
+
+    std::function<bool(int)> dfs = [&](int u) -> bool {
+        for (int v : adj[u]) {
+            int u2 = matchR[v];
+            if (u2 == -1 || (dist[u2] == dist[u] + 1 && dfs(u2))) {
+                matchL[u] = v;
+                matchR[v] = u;
+                return true;
+            }
+        }
+        dist[u] = -1;
+        return false;
+    };
+
+    int matching = 0;
+    while (bfs()) {
+        for (int u = 0; u < nL; u++) {
+            if (matchL[u] == -1) {
+                if (dfs(u)) matching++;
             }
         }
     }
-    return cone;
+    return matching == nL;
 }
 
-struct PIFeature { int occ = 0; int minDepth = 1e9; };
+// ------------------------
+// Bus grouping & signatures (I,B,U)
+// ------------------------
 
-static std::unordered_map<int,PIFeature> computePIFeaturesInCone(
-    const Circuit& c, int poNet,
-    const std::unordered_set<int>& coneNets,
-    const std::unordered_set<int>& conePIs)
-{
-    std::unordered_map<int,PIFeature> feat;
-    feat.reserve(conePIs.size() * 2);
+// ------------------------
+// Influence signature (simulation-based, inversion-invariant)
+// ------------------------
+// Motivation: when unate tables are dominated by 'B' (binate), unate-based row/col signatures
+// become nearly identical and provide little guidance. We add a simulation-based "influence spectrum"
+// that is:
+//   * invariant to PO inversion (uses pBal=min(p,1-p) and |P(y=1|x=1)-P(y=1|x=0)|),
+//   * invariant to PI permutation (sort the per-PI influences),
+//   * cheap to compute via 64-bit packed random simulation.
+//
+// For each PO y and each PI x, estimate influence:
+//   d(x->y) = | P(y=1 | x=1) - P(y=1 | x=0) |  in [0,1].
+// Then PO signature is the top-K sorted d-values (over all PIs) + pBal(y).
+// PI signature can be derived similarly (top-K over all POs), but currently we mainly use PO signature
+// to rank PO candidates.
+static constexpr int kInfTopK = 12;
 
-    // occ
-    for (int net : coneNets) {
-        const Net& n = c.nets[net];
-        if (n.isPI || n.isConst) continue;
-        int drv = n.driverGate;
-        if (drv < 0) continue;
-        const Gate& g = c.gates[drv];
-        for (int inNet : g.inNets) {
-            if (conePIs.count(inNet)) feat[inNet].occ++;
+// Additional PO signature: output-output correlation profile.
+// For each PO y, compute corrAbs(y, z) = |P(y==z) - 0.5| under random inputs
+// and take the top-K values over all other outputs.
+// This is invariant under PI permutation / PI inversion and also invariant
+// under independent PO inversion (since P(y==~z)=1-P(y==z)).
+static constexpr int kCorrTopK = 12;
+
+struct InfluenceSig {
+    float pBal = 0.0f; // min(P(y=1), P(y=0)) in [0,0.5]
+    std::array<float, kInfTopK> top{}; // sorted desc, padded with 0
+};
+
+struct CorrSig {
+    std::array<float, kCorrTopK> top{}; // sorted desc, padded with 0
+};
+
+static inline int popc64(uint64_t x) { return __builtin_popcountll(x); }
+
+static inline double influenceDist(const InfluenceSig& a, const InfluenceSig& b) {
+    double d = 2.0 * std::abs((double)a.pBal - (double)b.pBal);
+    for (int i = 0; i < kInfTopK; ++i) d += std::abs((double)a.top[i] - (double)b.top[i]);
+    return d;
+}
+
+static inline int influenceDistScore(const InfluenceSig& a, const InfluenceSig& b) {
+    // Scale to an integer for stable ordering.
+    return (int)std::llround(influenceDist(a, b) * 10000.0);
+}
+
+static void pruneAllowedPiByInfluenceSig(const std::vector<InfluenceSig>& piInf1,
+                                        const std::vector<InfluenceSig>& piInf2,
+                                        std::vector<std::vector<int>>& allowedPi1,
+                                        int keepK,
+                                        std::mt19937& rng) {
+    if (keepK <= 0) return;
+    if (piInf1.empty() || piInf2.empty()) return;
+    const int nPI2 = (int)allowedPi1.size();
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        auto& cand = allowedPi1[pi2];
+        if ((int)cand.size() <= keepK) continue;
+
+        std::vector<std::pair<int,int>> scored;
+        scored.reserve(cand.size());
+        for (int pi1 : cand) {
+            if (pi1 < 0 || pi1 >= (int)piInf1.size() || pi2 >= (int)piInf2.size()) continue;
+            int d = influenceDistScore(piInf1[pi1], piInf2[pi2]);
+            scored.push_back({d, pi1});
         }
-    }
-
-    // minDepth: BFS from PO backward
-    std::queue<std::pair<int,int>> q;
-    std::unordered_map<int,int> best;
-    best.reserve(coneNets.size() * 2);
-
-    q.push({poNet, 0});
-    best[poNet] = 0;
-
-    while (!q.empty()) {
-        auto cur = q.front(); q.pop();
-        int net = cur.first, d = cur.second;
-
-        if (conePIs.count(net)) {
-            auto &f = feat[net];
-            f.minDepth = std::min(f.minDepth, d);
+        if ((int)scored.size() <= keepK) {
+            cand.clear();
+            for (auto& p : scored) cand.push_back(p.second);
             continue;
         }
 
-        const Net& n = c.nets[net];
-        if (n.isConst) continue;
+        // Break ties randomly so we keep some diversity.
+        std::shuffle(scored.begin(), scored.end(), rng);
 
-        int drv = n.driverGate;
-        if (drv < 0) continue;
-        const Gate& g = c.gates[drv];
+        std::nth_element(scored.begin(), scored.begin() + keepK, scored.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        scored.resize(keepK);
 
-        for (int inNet : g.inNets) {
-            if (!coneNets.count(inNet)) continue;
-            int nd = d + 1;
-            auto it = best.find(inNet);
-            if (it == best.end() || nd < it->second) {
-                best[inNet] = nd;
-                q.push({inNet, nd});
-            }
-        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b) {
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                  });
+
+        cand.clear();
+        cand.reserve(keepK);
+        for (auto& p : scored) cand.push_back(p.second);
     }
-
-    for (int pi : conePIs) {
-        if (!feat.count(pi)) feat[pi] = PIFeature{};
-        if (feat[pi].minDepth >= (int)1e9) feat[pi].minDepth = (int)1e9;
-    }
-    return feat;
 }
 
-// ============ bus-aware candidate selection ============
 
-// 收集 circuit 的 input buses (bus member nets are PI)
-static std::vector<int> getPIBusIds(const Circuit& c, const BusInfo& b) {
-    return filterBusIdsByType(c, b, /*wantPIbus=*/true, /*wantPObus=*/false);
+static void simulatePOsByBatchSharedMasks(const Circuit& c,
+                                         const std::vector<int>& topo,
+                                         const std::vector<std::vector<uint64_t>>& masksByBatch,
+                                         std::vector<std::vector<uint64_t>>& outByBatch) {
+    const int batches = (int)masksByBatch.size();
+    const int nPO = (int)c.POs.size();
+    outByBatch.assign(batches, std::vector<uint64_t>(nPO, 0));
+    for (int b = 0; b < batches; ++b) {
+        outByBatch[b] = simulateCircuit64(c, topo, masksByBatch[b], c.POs);
+    }
 }
 
-// 建 netId -> PI busId (only for PI buses)
-static std::vector<int> buildNetToPIBusId(
-    const Circuit& c, const BusInfo& b,
-    const std::vector<int>& piBusIds)
-{
-    std::vector<int> net2bus((int)c.nets.size(), -1);
-    for (int bid : piBusIds) {
-        for (int nid : b.buses[bid].members) {
-            if (nid >= 0 && nid < (int)net2bus.size())
-                net2bus[nid] = bid;
-        }
-    }
-    return net2bus;
+static inline double corrDist(const CorrSig& a, const CorrSig& b) {
+    double d = 0.0;
+    for (int i = 0; i < kCorrTopK; ++i) d += std::abs((double)a.top[i] - (double)b.top[i]);
+    return d;
 }
 
-// 對某個 pi2，取得候選 pi1 列表：
-// 若 pi2 在某個 PI bus2 內 -> 候選優先取「size 相同」的 PI bus1 內所有 PI；
-// 若找不到 -> fallback 用 cone PIs1
-static std::vector<int> candidatePI1_for_pi2(
-    int pi2,
-    const std::unordered_set<int>& conePIs1,
-    const Circuit& c1, const BusInfo& b1,
-    const std::vector<int>& piBusIds1,
-    const std::vector<int>& net2piBus1,
-    const BusInfo& b2,
-    const std::vector<int>& net2piBus2)
-{
-    std::vector<int> cand;
-    int bid2 = (pi2 >= 0 && pi2 < (int)net2piBus2.size()) ? net2piBus2[pi2] : -1;
-    if (bid2 != -1) {
-        int sz2 = (int)b2.buses[bid2].members.size();
-
-        // 收集所有 size==sz2 的 PI buses in c1
-        for (int bid1 : piBusIds1) {
-            int sz1 = (int)b1.buses[bid1].members.size();
-            if (sz1 != sz2) continue;
-            for (int nid : b1.buses[bid1].members) {
-                if (nid >= 0 && nid < (int)c1.nets.size() && c1.nets[nid].isPI) {
-                    cand.push_back(nid);
-                }
-            }
-        }
-
-        // 如果 size match 的 bus1 都找不到，退回同 busId1（如果 pi2 的 bus size 很特別）
-        if (cand.empty()) {
-            // fallback: allow any PI bus1 members
-            for (int bid1 : piBusIds1) {
-                for (int nid : b1.buses[bid1].members) {
-                    if (nid >= 0 && nid < (int)c1.nets.size() && c1.nets[nid].isPI)
-                        cand.push_back(nid);
-                }
-            }
-        }
-    }
-
-    if (cand.empty()) {
-        // fallback: cone PIs1
-        cand.reserve(conePIs1.size());
-        for (int pi1 : conePIs1) cand.push_back(pi1);
-    }
-
-    // 去重
-    std::sort(cand.begin(), cand.end());
-    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
-    return cand;
+static inline int corrDistScore(const CorrSig& a, const CorrSig& b) {
+    return (int)std::llround(corrDist(a, b) * 10000.0);
 }
 
-// ============ multi-hypothesis builder ============
+static void computePOBaselineOutputsSharedMasks(const Circuit& c,
+                                                const std::vector<int>& topo,
+                                                const std::vector<std::vector<uint64_t>>& masksByBatch,
+                                                std::vector<std::vector<uint64_t>>& outByBatch) {
+    const int nPI = (int)c.PIs.size();
+    const int nPO = (int)c.POs.size();
+    const int batches = (int)masksByBatch.size();
+    outByBatch.assign((size_t)batches, std::vector<uint64_t>((size_t)nPO, 0));
+    if (nPI == 0 || nPO == 0 || batches == 0) return;
+    for (int b = 0; b < batches; ++b) {
+        const auto& piMask = masksByBatch[b];
+        outByBatch[b] = simulateCircuit64(c, topo, piMask, c.POs);
+    }
+}
 
-struct WeightCfg { int wDepth; int wOcc; };
+static void computePOCorrSigsFromOutputs(const std::vector<std::vector<uint64_t>>& outByBatch,
+                                        std::vector<CorrSig>& corrOut) {
+    const int batches = (int)outByBatch.size();
+    const int nPO = batches ? (int)outByBatch[0].size() : 0;
+    const int totalBits = batches * 64;
+    corrOut.assign((size_t)nPO, CorrSig{});
+    if (batches == 0 || nPO == 0) return;
 
-static std::vector<LocalHypothesis> buildLocalPIMappingHypothesesMulti(
-    const Circuit& c1, const BusInfo& b1,
-    const Circuit& c2, const BusInfo& b2,
-    int po1, int po2,
-    const std::vector<int>& piBusIds1,
-    const std::vector<int>& piBusIds2,
-    const std::vector<int>& net2piBus1,
-    const std::vector<int>& net2piBus2,
-    int L_max = 6)
-{
-    std::vector<LocalHypothesis> out;
-
-    // cones + PIs
-    std::unordered_set<int> pis1, pis2;
-    auto cone1 = collectFaninCone(c1, po1, pis1);
-    auto cone2 = collectFaninCone(c2, po2, pis2);
-
-    if (pis2.empty()) return out; // 沒有 PI2 用不到 mapping
-    if (pis1.empty()) {
-        // 極端：cone1 沒 PI，全部綁 CONST0 當一個 hypothesis
-        LocalHypothesis H;
-        H.pis1_used.assign(pis1.begin(), pis1.end());
-        H.pis2_used.assign(pis2.begin(), pis2.end());
-        for (int pi2 : pis2) H.map2to1[pi2] = -2;
-        out.push_back(std::move(H));
-        return out;
+    // Pre-pack outputs as [po][b] for cache-friendly pairwise popcounts.
+    std::vector<std::vector<uint64_t>> outPO((size_t)nPO, std::vector<uint64_t>((size_t)batches, 0));
+    for (int b = 0; b < batches; ++b) {
+        for (int po = 0; po < nPO; ++po) outPO[po][b] = outByBatch[b][po];
     }
 
-    auto f1 = computePIFeaturesInCone(c1, po1, cone1, pis1);
-    auto f2 = computePIFeaturesInCone(c2, po2, cone2, pis2);
-
-    // 固定 ordering（讓 Hungarian matrix deterministic）
-    std::vector<int> P2(pis2.begin(), pis2.end());
-    std::sort(P2.begin(), P2.end());
-
-    // 多組權重 -> 多個 hypothesis
-    std::vector<WeightCfg> cfgs = {
-        {5, 1}, {10, 1}, {20, 1},
-        {5, 2}, {10, 2}, {20, 2}
-    };
-    if ((int)cfgs.size() > L_max) cfgs.resize(L_max);
-
-    // 用來去重：把 mapping 轉成 hash key
-    auto hashHyp = [&](const LocalHypothesis& H)->std::string{
-        std::vector<std::pair<int,int>> kv;
-        kv.reserve(H.map2to1.size());
-        for (auto &p : H.map2to1) kv.push_back(p);
-        std::sort(kv.begin(), kv.end());
-        std::string s;
-        s.reserve(kv.size() * 16);
-        for (auto &p : kv) {
-            s += std::to_string(p.first);
-            s += ":";
-            s += std::to_string(p.second);
-            s += ";";
-        }
-        return s;
-    };
-    std::unordered_set<std::string> seen;
-
-    for (auto cfg : cfgs) {
-        // 我們做 one-to-one assignment：rows = P2（pi2），cols = candidate pi1 pool
-        // 但每個 pi2 的候選集可能不同，所以我們取「聯集候選」當 col set，並用大 penalty 表示不可用
-        std::vector<std::vector<int>> candList;
-        candList.reserve(P2.size());
-
-        std::unordered_set<int> colSet;
-        for (int pi2 : P2) {
-            auto cand = candidatePI1_for_pi2(
-                pi2, pis1, c1, b1, piBusIds1, net2piBus1, b2, net2piBus2);
-            candList.push_back(cand);
-            for (int pi1 : cand) colSet.insert(pi1);
-        }
-
-        std::vector<int> P1(colSet.begin(), colSet.end());
-        std::sort(P1.begin(), P1.end());
-
-        int n = (int)P2.size();
-        int m = (int)P1.size();
-
-        // cost matrix n x m
-        const double INF = 1e9;
-        std::vector<std::vector<double>> cost(n, std::vector<double>(m, INF));
-
-        // 為了快速查 cand membership
-        std::vector<std::unordered_set<int>> candSet(n);
-        for (int i = 0; i < n; i++) {
-            candSet[i].reserve(candList[i].size() * 2);
-            for (int x : candList[i]) candSet[i].insert(x);
-        }
-
-        for (int i = 0; i < n; i++) {
-            int pi2 = P2[i];
-            const auto &a = f2[pi2];
-            for (int j = 0; j < m; j++) {
-                int pi1 = P1[j];
-                if (!candSet[i].count(pi1)) continue; // not allowed
-                const auto &b = f1[pi1];
-                double sc =
-                    (double)cfg.wDepth * std::abs(a.minDepth - b.minDepth) +
-                    (double)cfg.wOcc   * std::abs(a.occ - b.occ);
-                cost[i][j] = sc;
+    for (int po = 0; po < nPO; ++po) {
+        std::vector<float> vals;
+        vals.reserve((size_t)std::max(0, nPO - 1));
+        for (int other = 0; other < nPO; ++other) {
+            if (other == po) continue;
+            int ham = 0;
+            for (int b = 0; b < batches; ++b) {
+                ham += popc64(outPO[po][b] ^ outPO[other][b]);
             }
+            int eq = totalBits - ham;
+            // corrAbs = |P(eq) - 0.5|
+            float corrAbs = std::abs((float)eq / (float)totalBits - 0.5f);
+            vals.push_back(corrAbs);
         }
+        std::sort(vals.begin(), vals.end(), std::greater<float>());
+        for (int k = 0; k < kCorrTopK && k < (int)vals.size(); ++k) {
+            corrOut[po].top[k] = vals[k];
+        }
+    }
+}
 
-        // Hungarian 要求方陣：若 m < n，補 dummy cols -> 代表 mapping 到 CONST0（先用 const）
-        // 你目前 hungarianMinCost 回傳 rows->col index，所以我們補齊到 size = max(n,m)
-        int dim = std::max(n, m);
-        std::vector<std::vector<double>> square(dim, std::vector<double>(dim, INF));
-        for (int i = 0; i < dim; i++) {
-            for (int j = 0; j < dim; j++) {
-                if (i < n && j < m) square[i][j] = cost[i][j];
-                else if (i < n && j >= m) {
-                    // dummy col: map to CONST0 with penalty
-                    square[i][j] = 10000.0; // 你可以調大/調小
-                } else {
-                    square[i][j] = 0.0;
-                }
+static void computeInfluenceSigsSharedMasks(const Circuit& c,
+                                            const std::vector<int>& topo,
+                                            const std::vector<std::vector<uint64_t>>& masksByBatch,
+                                            const std::vector<std::vector<uint64_t>>& outByBatch,
+                                            std::vector<InfluenceSig>& poSigOut,
+                                            std::vector<InfluenceSig>* piSigOut = nullptr) {
+    const int nPI = (int)c.PIs.size();
+    const int nPO = (int)c.POs.size();
+    const int batches = (int)masksByBatch.size();
+    const int totalBits = batches * 64;
+
+    poSigOut.assign(nPO, InfluenceSig{});
+    if (piSigOut) piSigOut->assign(nPI, InfluenceSig{});
+
+    if (nPI == 0 || nPO == 0 || batches == 0) return;
+
+    // cnt1[pi] = number of samples where x=1
+    std::vector<int> cnt1(nPI, 0);
+    for (int pi = 0; pi < nPI; ++pi) {
+        int s1 = 0;
+        for (int b = 0; b < batches; ++b) s1 += popc64(masksByBatch[b][pi]);
+        cnt1[pi] = s1;
+    }
+
+    // cntPO1[po] = number of samples where y=1
+    std::vector<int> cntPO1(nPO, 0);
+    for (int po = 0; po < nPO; ++po) {
+        int s1 = 0;
+        for (int b = 0; b < batches; ++b) s1 += popc64(outByBatch[b][po]);
+        cntPO1[po] = s1;
+    }
+
+    // onesXY[po][pi] = number of samples where (x=1,y=1)
+    std::vector<std::vector<int>> onesXY(nPO, std::vector<int>(nPI, 0));
+    for (int po = 0; po < nPO; ++po) {
+        for (int pi = 0; pi < nPI; ++pi) {
+            int s11 = 0;
+            for (int b = 0; b < batches; ++b) {
+                s11 += popc64(outByBatch[b][po] & masksByBatch[b][pi]);
             }
+            onesXY[po][pi] = s11;
         }
+    }
 
-        std::vector<int> assign = hungarianMinCost(square);
+    // If we also need PI signatures, cache influence matrix [po][pi].
+    std::vector<std::vector<float>> infMat;
+    if (piSigOut) infMat.assign(nPO, std::vector<float>(nPI, 0.0f));
 
-        LocalHypothesis H;
-        H.pis1_used.assign(pis1.begin(), pis1.end());
-        H.pis2_used.assign(pis2.begin(), pis2.end());
+    // Build PO signatures: balance + top-K influences |P(y=1|x=1)-P(y=1|x=0)|
+    for (int po = 0; po < nPO; ++po) {
+        InfluenceSig sig;
+        double py = (double)cntPO1[po] / (double)totalBits;
+        sig.pBal = (float)std::min(py, 1.0 - py);
 
-        for (int i = 0; i < n; i++) {
-            int pi2 = P2[i];
-            int j = assign[i];
-            if (j < 0) { H.map2to1[pi2] = -2; continue; }
-
-            if (j < m) {
-                // map to real pi1
-                H.map2to1[pi2] = P1[j];
-            } else {
-                // dummy => CONST0
-                H.map2to1[pi2] = -2;
+        std::vector<float> infl;
+        infl.reserve(nPI);
+        for (int pi = 0; pi < nPI; ++pi) {
+            int c1 = cnt1[pi];
+            int c0 = totalBits - c1;
+            if (c1 == 0 || c0 == 0) { 
+                if (piSigOut) infMat[po][pi] = 0.0f;
+                infl.push_back(0.0f);
+                continue;
             }
+            int a = onesXY[po][pi];               // x=1,y=1
+            int b = cntPO1[po] - a;               // x=0,y=1  (since y=1 total minus x=1,y=1)
+            double p1 = (double)a / (double)c1;
+            double p0 = (double)b / (double)c0;
+            float v = (float)std::abs(p1 - p0);
+            if (piSigOut) infMat[po][pi] = v;
+            infl.push_back(v);
+        }
+        std::sort(infl.begin(), infl.end(), std::greater<float>());
+        for (int i = 0; i < kInfTopK; ++i) sig.top[i] = (i < (int)infl.size()) ? infl[i] : 0.0f;
+
+        poSigOut[po] = sig;
+    }
+
+    // Build PI signatures: balance + top-K influences across POs (invariant to output inversion).
+    if (piSigOut) {
+        piSigOut->assign(nPI, InfluenceSig{});
+        for (int pi = 0; pi < nPI; ++pi) {
+            InfluenceSig sig;
+            double px = (double)cnt1[pi] / (double)totalBits;
+            sig.pBal = (float)std::min(px, 1.0 - px);
+
+            std::vector<float> infl;
+            infl.reserve(nPO);
+            for (int po = 0; po < nPO; ++po) infl.push_back(infMat[po][pi]);
+
+            std::sort(infl.begin(), infl.end(), std::greater<float>());
+            for (int i = 0; i < kInfTopK; ++i) sig.top[i] = (i < (int)infl.size()) ? infl[i] : 0.0f;
+
+            (*piSigOut)[pi] = sig;
+        }
+    }
+}
+
+struct PortBusGroup {
+    int busId = -1;                 // index in BusInfo.buses
+    std::vector<int> portIdx;        // indices into t.{piNetIds,poNetIds}
+    std::vector<std::array<int,3>> triples; // sorted (I,B,U) per member
+};
+
+static std::array<int,3> colIBU(const UnateTable& t, int piIdx) {
+    int cntI = 0, cntB = 0, cntU = 0;
+    for (int po = 0; po < t.nPO; po++) {
+        char r = redRel(t.rel[po][piIdx]);
+        if (r == 'I') cntI++;
+        else if (r == 'B') cntB++;
+        else cntU++;
+    }
+    return {cntI, cntB, cntU};
+}
+
+static std::array<int,3> rowIBU(const UnateTable& t, int poIdx) {
+    int cntI = 0, cntB = 0, cntU = 0;
+    for (int pi = 0; pi < t.nPI; pi++) {
+        char r = redRel(t.rel[poIdx][pi]);
+        if (r == 'I') cntI++;
+        else if (r == 'B') cntB++;
+        else cntU++;
+    }
+    return {cntI, cntB, cntU};
+}
+
+static int busDistL1(const PortBusGroup& a, const PortBusGroup& b) {
+    if (a.portIdx.size() != b.portIdx.size()) return 1e9;
+    int d = 0;
+    for (size_t i = 0; i < a.triples.size(); i++) {
+        for (int k = 0; k < 3; k++) d += std::abs(a.triples[i][k] - b.triples[i][k]);
+    }
+    return d;
+}
+
+static void extractBusGroups(const Circuit& c,
+                             const BusInfo& b,
+                             const UnateTable& t,
+                             bool isInput,
+                             std::vector<PortBusGroup>& groups,
+                             std::vector<int>& nonBusPorts) {
+    // Build netId -> (piIdx or poIdx)
+    std::vector<int> netToIdx(c.nets.size(), -1);
+    if (isInput) {
+        for (int i = 0; i < t.nPI; i++) netToIdx[t.piNetIds[i]] = i;
+    } else {
+        for (int i = 0; i < t.nPO; i++) netToIdx[t.poNetIds[i]] = i;
+    }
+
+    groups.clear();
+    for (int busId = 0; busId < (int)b.buses.size(); busId++) {
+        PortBusGroup g;
+        g.busId = busId;
+        for (int netId : b.buses[busId].members) {
+            if (netId < 0 || netId >= (int)netToIdx.size()) continue;
+            int idx = netToIdx[netId];
+            if (idx >= 0) g.portIdx.push_back(idx);
+        }
+        if (!g.portIdx.empty()) {
+            g.triples.reserve(g.portIdx.size());
+            for (int idx : g.portIdx) {
+                g.triples.push_back(isInput ? colIBU(t, idx) : rowIBU(t, idx));
+            }
+            std::sort(g.triples.begin(), g.triples.end());
+            groups.push_back(std::move(g));
+        }
+    }
+
+    nonBusPorts.clear();
+    if (isInput) {
+        for (int pi = 0; pi < t.nPI; pi++) {
+            int netId = t.piNetIds[pi];
+            if (netId >= 0 && netId < (int)b.netToBus.size() && b.netToBus[netId] >= 0) continue;
+            nonBusPorts.push_back(pi);
+        }
+    } else {
+        for (int po = 0; po < t.nPO; po++) {
+            int netId = t.poNetIds[po];
+            if (netId >= 0 && netId < (int)b.netToBus.size() && b.netToBus[netId] >= 0) continue;
+            nonBusPorts.push_back(po);
+        }
+    }
+}
+
+// Build adjacency for bus-to-bus matching.
+// Candidate edges are restricted to same width and the top-K smallest distances.
+static bool buildBusAdj(const std::vector<PortBusGroup>& g1,
+                        const std::vector<PortBusGroup>& g2,
+                        int topK,
+                        std::vector<std::vector<int>>& adj) {
+    const int nL = (int)g2.size();
+    const int nR = (int)g1.size();
+    adj.assign(nL, {});
+
+    if (nL != nR) return false;
+
+    for (int i = 0; i < nL; i++) {
+        std::vector<std::pair<int,int>> scored;
+        scored.reserve(nR);
+        for (int j = 0; j < nR; j++) {
+            if (g2[i].portIdx.size() != g1[j].portIdx.size()) continue;
+            scored.push_back({busDistL1(g2[i], g1[j]), j});
+        }
+        if (scored.empty()) return false;
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        int keep = std::min(topK, (int)scored.size());
+        // keep all ties at boundary
+        if (keep < (int)scored.size()) {
+            int bound = scored[keep - 1].first;
+            while (keep < (int)scored.size() && scored[keep].first == bound) keep++;
         }
 
-        std::string key = hashHyp(H);
-        if (!seen.count(key)) {
-            seen.insert(key);
-            out.push_back(std::move(H));
+        adj[i].reserve(keep);
+        for (int k = 0; k < keep; k++) adj[i].push_back(scored[k].second);
+        if (adj[i].empty()) return false;
+    }
+    return true;
+}
+
+static uint64_t hashMatching(const std::vector<int>& matchL) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int v : matchL) {
+        uint64_t x = (uint64_t)(v + 1000003);
+        h ^= x;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Sample multiple bus matchings by shuffling adjacency lists and running HK.
+static std::vector<std::vector<int>> sampleBusMatchings(const std::vector<std::vector<int>>& baseAdj,
+                                                        int nR,
+                                                        int samples,
+                                                        std::mt19937& rng) {
+    std::vector<std::vector<int>> out;
+    std::unordered_set<uint64_t> seen;
+
+    if (baseAdj.empty()) return out;
+
+    for (int s = 0; s < samples; s++) {
+        std::vector<std::vector<int>> adj = baseAdj;
+        for (auto& v : adj) {
+            if (v.size() > 1) std::shuffle(v.begin(), v.end(), rng);
+        }
+
+        std::vector<int> matchL;
+        if (!hopcroftKarp(adj, nR, matchL)) break;
+
+        uint64_t h = hashMatching(matchL);
+        if (seen.insert(h).second) {
+            out.push_back(std::move(matchL));
+            if ((int)out.size() >= samples) break;
         }
     }
 
     return out;
 }
 
-// ------------- step 5 --------------
-static std::vector<int> getPINetsSorted(const Circuit& c) {
-    std::vector<int> pis = c.PIs;
-    std::sort(pis.begin(), pis.end());
-    return pis;
+// For small bus counts, we can enumerate multiple perfect matchings cheaply.
+// This avoids relying on HK randomness (which can still collapse to a single matching
+// in some graphs).
+static std::vector<std::vector<int>> enumerateBusMatchingsSmall(const std::vector<std::vector<int>>& baseAdj,
+                                                                int nR,
+                                                                int limit,
+                                                                std::mt19937& rng) {
+    const int nL = (int)baseAdj.size();
+    std::vector<std::vector<int>> out;
+    if (nL == 0) return out;
+    if (limit <= 0) return out;
+
+    // Left order: smaller degree first (better pruning)
+    std::vector<int> order(nL);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return baseAdj[a].size() < baseAdj[b].size();
+    });
+
+    std::vector<int> cur(nL, -1);
+    std::vector<char> usedR(nR, 0);
+
+    std::function<void(int)> dfs = [&](int idx) {
+        if ((int)out.size() >= limit) return;
+        if (idx == nL) {
+            out.push_back(cur);
+            return;
+        }
+        int u = order[idx];
+        if (baseAdj[u].empty()) return;
+
+        // Randomize neighbor order a bit so the first few enumerated matchings are diverse.
+        std::vector<int> nbr = baseAdj[u];
+        if (nbr.size() > 1) std::shuffle(nbr.begin(), nbr.end(), rng);
+        for (int v : nbr) {
+            if (v < 0 || v >= nR) continue;
+            if (usedR[v]) continue;
+            usedR[v] = 1;
+            cur[u] = v;
+            dfs(idx + 1);
+            cur[u] = -1;
+            usedR[v] = 0;
+            if ((int)out.size() >= limit) return;
+        }
+    };
+
+    dfs(0);
+    return out;
 }
 
-static std::vector<uint64_t> buildPI2MasksFromHyp(
-    const Circuit& c1, const Circuit& c2,
-    const std::vector<int>& piList1,           // sorted PI nets of c1
-    const std::vector<int>& piList2,           // sorted PI nets of c2
-    const std::vector<uint64_t>& piMasks1,     // same length as piList1
-    const LocalHypothesis& H,
-    uint64_t seed)
-{
-    // build map: pi1 net -> mask
-    std::unordered_map<int,uint64_t> pi1Mask;
-    pi1Mask.reserve(piList1.size()*2);
-    for (size_t i=0;i<piList1.size();i++) pi1Mask[piList1[i]] = piMasks1[i];
-
-    std::vector<uint64_t> piMasks2(piList2.size(), 0);
-    uint64_t s = seed;
-
-    int dbgShown = 0;
-
-    for (size_t i=0;i<piList2.size();i++) {
-        int pi2 = piList2[i];
-        auto it = H.map2to1.find(pi2);
-        if (it == H.map2to1.end()) {
-            // free PI2 -> random
-            piMasks2[i] = splitmix64(s);
-            continue;
-        }
-        int m = it->second;
-        if (m == -2) piMasks2[i] = 0ULL;          // CONST0
-        else if (m == -3) piMasks2[i] = ~0ULL;    // CONST1
-        else {
-            auto it1 = pi1Mask.find(m);
-            piMasks2[i] = (it1==pi1Mask.end()) ? splitmix64(s) : it1->second;
-        }
-        
-        // if (dbgShown++ < 12) {
-        //     std::cerr << "[DBG][HypAlign] pi2=" << c2.nets[pi2].name
-        //               << " i2=" << i
-        //               << " -> to=" << m;
-
-        //     if (m >= 0) std::cerr << " (" << c1.nets[m].name << ")";
-        //     else if (m == -2) std::cerr << " (CONST0)";
-        //     else if (m == -3) std::cerr << " (CONST1)";
-
-        //     std::cerr << "\n";
-        // }
+// Convert a bus-group-level matching (g2Idx -> g1Idx) into busId mapping (size=b2.buses).
+static std::vector<int> toBusIdMap(const BusInfo& b2,
+                                   const std::vector<PortBusGroup>& g1,
+                                   const std::vector<PortBusGroup>& g2,
+                                   const std::vector<int>& matchBus2ToBus1) {
+    std::vector<int> busMap((int)b2.buses.size(), -1);
+    for (int i = 0; i < (int)g2.size(); i++) {
+        int j = matchBus2ToBus1[i];
+        if (j < 0 || j >= (int)g1.size()) continue;
+        busMap[g2[i].busId] = g1[j].busId;
     }
-
-    return piMasks2;
+    return busMap;
 }
 
-static void debugCheckMaskAlignment(
-    const Circuit& c1, const Circuit& c2,
-    const std::vector<int>& piList1, const std::vector<int>& piList2,
-    const std::vector<uint64_t>& piMasks1,
-    const std::vector<uint64_t>& piMasks2,
-    const LocalHypothesis& H,
-    int maxCheck = 20,
-    bool abortOnMismatch = true)
-{
-    // netId -> index for quick locate
-    std::unordered_map<int,int> idx1, idx2;
-    idx1.reserve(piList1.size()*2);
-    idx2.reserve(piList2.size()*2);
-    for (int i = 0; i < (int)piList1.size(); i++) idx1[piList1[i]] = i;
-    for (int i = 0; i < (int)piList2.size(); i++) idx2[piList2[i]] = i;
+// Build allowed idx1 candidates for each idx2 based on busId mapping and busedness filter.
+static bool buildAllowedByBus(const Circuit& c1,
+                              const Circuit& c2,
+                              const BusInfo& b1,
+                              const BusInfo& b2,
+                              const UnateTable& t1,
+                              const UnateTable& t2,
+                              bool isInput,
+                              const std::vector<int>& busIdMap2to1,
+                              std::vector<std::vector<int>>& allowedIdx1ForIdx2) {
+    (void)c2;
 
-    int shown = 0;
-    int mismatch = 0;
+    std::vector<int> netToIdx1(c1.nets.size(), -1);
+    if (isInput) {
+        for (int i = 0; i < t1.nPI; i++) netToIdx1[t1.piNetIds[i]] = i;
+        allowedIdx1ForIdx2.assign(t2.nPI, {});
 
-    for (auto &kv : H.map2to1) {
-        int pi2 = kv.first;
-        int m   = kv.second;
-
-        auto it2 = idx2.find(pi2);
-        if (it2 == idx2.end()) continue; // hypothesis 指到的 pi2 不是「全域 PI」，略過
-
-        int i2 = it2->second;
-        uint64_t got = piMasks2[i2];
-
-        uint64_t expect = 0;
-        bool hasExpect = true;
-
-        if (m == -2) { expect = 0ULL; }
-        else if (m == -3) { expect = ~0ULL; }
-        else {
-            auto it1 = idx1.find(m);
-            if (it1 == idx1.end()) {
-                // pi1 不在 piList1 => 你目前 buildPI2MasksFromHyp() 會用 random fallback
-                hasExpect = false;
-            } else {
-                expect = piMasks1[it1->second];
-            }
+        std::vector<int> nonBus1;
+        nonBus1.reserve(t1.nPI);
+        for (int i = 0; i < t1.nPI; i++) {
+            int netId = t1.piNetIds[i];
+            if (netId >= 0 && netId < (int)b1.netToBus.size() && b1.netToBus[netId] >= 0) continue;
+            nonBus1.push_back(i);
         }
 
-        if (shown < maxCheck) {
-            std::cerr << "[DBG][AlignChk] pi2[" << i2 << "] "
-                      << c2.nets[pi2].name << " <- ";
-
-            if (m >= 0) std::cerr << "pi1 " << c1.nets[m].name;
-            else if (m == -2) std::cerr << "CONST0";
-            else if (m == -3) std::cerr << "CONST1";
-            else std::cerr << "???";
-
-            std::cerr << " | got=0x" << std::hex << got << std::dec;
-
-            if (hasExpect) {
-                std::cerr << " expect=0x" << std::hex << expect << std::dec;
-                std::cerr << " eq=" << (got == expect);
-            } else {
-                std::cerr << " expect=<FREE/RAND>";
+        for (int pi2 = 0; pi2 < t2.nPI; pi2++) {
+            int net2 = t2.piNetIds[pi2];
+            int bus2 = (net2 >= 0 && net2 < (int)b2.netToBus.size()) ? b2.netToBus[net2] : -1;
+            if (bus2 < 0) {
+                allowedIdx1ForIdx2[pi2] = nonBus1;
+                continue;
             }
-            std::cerr << "\n";
-            shown++;
-        }
-
-        if (hasExpect && got != expect) {
-            mismatch++;
-            if (abortOnMismatch) {
-                std::cerr << "[ERR][AlignChk] MASK MISMATCH: "
-                          << "pi2=" << c2.nets[pi2].name
-                          << " mapped-to=" << (m >= 0 ? c1.nets[m].name : (m==-2?"CONST0":"CONST1"))
-                          << "\n";
-                throw std::runtime_error("PI mask alignment mismatch (Step5 input order bug?)");
+            if (bus2 >= (int)busIdMap2to1.size()) return false;
+            int bus1 = busIdMap2to1[bus2];
+            if (bus1 < 0 || bus1 >= (int)b1.buses.size()) return false;
+            std::vector<int> cand;
+            for (int net1 : b1.buses[bus1].members) {
+                if (net1 < 0 || net1 >= (int)netToIdx1.size()) continue;
+                int idx1 = netToIdx1[net1];
+                if (idx1 >= 0) cand.push_back(idx1);
             }
+            allowedIdx1ForIdx2[pi2] = std::move(cand);
+            if (allowedIdx1ForIdx2[pi2].empty()) return false;
         }
-    }
-
-    if (mismatch == 0) {
-        std::cerr << "[DBG][AlignChk] OK: all checked mapped PI masks aligned.\n";
+        return true;
     } else {
-        std::cerr << "[DBG][AlignChk] mismatch count=" << mismatch << "\n";
-    }
+        for (int i = 0; i < t1.nPO; i++) netToIdx1[t1.poNetIds[i]] = i;
+        allowedIdx1ForIdx2.assign(t2.nPO, {});
 
-    // 也順手 dump 前幾個全域 PI 的 (index, name, mask) 讓你肉眼看位置是否一致
-    int lim1 = std::min<int>((int)piList1.size(), 12);
-    int lim2 = std::min<int>((int)piList2.size(), 12);
-    std::cerr << "[DBG][PIvecDump] C1 PI masks (first " << lim1 << ")\n";
-    for (int i=0;i<lim1;i++) {
-        int nid = piList1[i];
-        std::cerr << "  C1[" << i << "] " << c1.nets[nid].name
-                  << " mask=0x" << std::hex << piMasks1[i] << std::dec << "\n";
-    }
-    std::cerr << "[DBG][PIvecDump] C2 PI masks (first " << lim2 << ")\n";
-    for (int i=0;i<lim2;i++) {
-        int nid = piList2[i];
-        std::cerr << "  C2[" << i << "] " << c2.nets[nid].name
-                  << " mask=0x" << std::hex << piMasks2[i] << std::dec << "\n";
+        std::vector<int> nonBus1;
+        nonBus1.reserve(t1.nPO);
+        for (int i = 0; i < t1.nPO; i++) {
+            int netId = t1.poNetIds[i];
+            if (netId >= 0 && netId < (int)b1.netToBus.size() && b1.netToBus[netId] >= 0) continue;
+            nonBus1.push_back(i);
+        }
+
+        for (int po2 = 0; po2 < t2.nPO; po2++) {
+            int net2 = t2.poNetIds[po2];
+            int bus2 = (net2 >= 0 && net2 < (int)b2.netToBus.size()) ? b2.netToBus[net2] : -1;
+            if (bus2 < 0) {
+                allowedIdx1ForIdx2[po2] = nonBus1;
+                continue;
+            }
+            if (bus2 >= (int)busIdMap2to1.size()) return false;
+            int bus1 = busIdMap2to1[bus2];
+            if (bus1 < 0 || bus1 >= (int)b1.buses.size()) return false;
+            std::vector<int> cand;
+            for (int net1 : b1.buses[bus1].members) {
+                if (net1 < 0 || net1 >= (int)netToIdx1.size()) continue;
+                int idx1 = netToIdx1[net1];
+                if (idx1 >= 0) cand.push_back(idx1);
+            }
+            allowedIdx1ForIdx2[po2] = std::move(cand);
+            if (allowedIdx1ForIdx2[po2].empty()) return false;
+        }
+        return true;
     }
 }
 
-static bool quickVerifyHypothesisBySim64(
-    const Circuit& c1, const std::vector<int>& topo1,
-    const Circuit& c2, const std::vector<int>& topo2,
-    int po1, int po2, bool inv,
-    const LocalHypothesis& H,
-    int batches, uint64_t seedBase)
-{
-    const auto& piList1 = c1.PIs;  // 注意：用原順序
-    const auto& piList2 = c2.PIs;
-    // ----------debug----------
-    // static bool printed = false;
-    // if (!printed) {
-    //     printed = true;
+// ------------------------
+// PO candidate order (bus-aware restriction)
+// ------------------------
 
-    //     auto dump = [&](const Circuit& c, const char* tag){
-    //         std::cerr << "[DBG][PIOrder] " << tag
-    //                 << " c.PIs.size=" << c.PIs.size() << "\n";
-    //         int lim = std::min<int>((int)c.PIs.size(), 30);
-    //         for (int i = 0; i < lim; i++) {
-    //             int nid = c.PIs[i];
-    //             std::cerr << "  [" << i << "] netId=" << nid
-    //                     << " name=" << c.nets[nid].name << "\n";
-    //         }
-    //     };
+static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
+                                                 const UnateTable& t2,
+                                                 const std::vector<std::vector<int>>& allowedPo1,
+                                                 const std::vector<InfluenceSig>& poInf1,
+                                                 const std::vector<InfluenceSig>& poInf2,
+                                                 const std::vector<CorrSig>& poCorr1,
+                                                 const std::vector<CorrSig>& poCorr2,
+                                                 std::mt19937& rng) {
+    vector<RowFeat> f1(t1.nPO), f2(t2.nPO);
 
-    //     dump(c1, "C1");
-    //     dump(c2, "C2");
-    // }
+    // Reduced column keys for rowRefKey (still useful as a weak tie-break).
+    auto ck1 = computeColReducedKeys(t1);
+    auto ck2 = computeColReducedKeys(t2);
 
-    // ----------debug end----------
-    for (int b=0;b<batches;b++) {
-        uint64_t s = seedBase + 0x9e3779b97f4a7c15ULL * (uint64_t)b;
+    for (int i = 0; i < t1.nPO; i++) {
+        f1[i] = makeRowFeat(t1, i);
+        f1[i].refKey = makeRowRefKey(t1, i, ck1, f1[i]);
+    }
+    for (int i = 0; i < t2.nPO; i++) {
+        f2[i] = makeRowFeat(t2, i);
+        f2[i].refKey = makeRowRefKey(t2, i, ck2, f2[i]);
+    }
 
-        // PI1 random masks
-        std::vector<uint64_t> piMasks1(piList1.size());
-        for (size_t i=0;i<piMasks1.size();i++) piMasks1[i] = splitmix64(s);
+    vector<vector<int>> ord(t2.nPO);
 
-        // PI2 masks from hypothesis
-        auto piMasks2 = buildPI2MasksFromHyp(c1, c2, piList1, piList2, piMasks1, H, s);
-        // --- debug : Step5 input alignment check (only do for first few batches to avoid spam) ---
-        if (b == 0) {
-            debugCheckMaskAlignment(
-                c1, c2,
-                piList1, piList2,
-                piMasks1, piMasks2,
-                H,
-                /*maxCheck=*/20,
-                /*abortOnMismatch=*/true
-            );
+    for (int po2 = 0; po2 < t2.nPO; po2++) {
+        const vector<int>* allow = nullptr;
+        if (!allowedPo1.empty()) allow = &allowedPo1[po2];
+
+        vector<std::pair<int,int>> scored;
+        if (allow) scored.reserve(allow->size());
+        else scored.reserve((size_t)t1.nPO);
+
+        auto addOne = [&](int po1) {
+            // Primary: simulation-based influence signature (robust under inversion and PI permutation).
+            int sc = 0;
+            if ((int)poInf1.size() == t1.nPO && (int)poInf2.size() == t2.nPO) {
+                sc += influenceDistScore(poInf1[po1], poInf2[po2]);
+            }
+
+            // Additional: PO correlation profile (robust even when unate is mostly binate).
+            if ((int)poCorr1.size() == t1.nPO && (int)poCorr2.size() == t2.nPO) {
+                sc += corrDistScore(poCorr1[po1], poCorr2[po2]);
+            }
+
+            // Secondary: unate row-feat distance (often weak when binate dominates).
+            sc += rowFeatDistL1(f1[po1], f2[po2]) * 200;
+
+            // Tertiary: reduced-key row reference (treat as a *bonus*, not a hard filter).
+            if (!f1[po1].refKey.empty() && f1[po1].refKey == f2[po2].refKey) {
+                sc -= 50000;
+            }
+            scored.emplace_back(sc, po1);
+        };
+
+        if (allow) {
+            for (int po1 : *allow) addOne(po1);
+        } else {
+            for (int po1 = 0; po1 < t1.nPO; po1++) addOne(po1);
         }
 
-        // simulate just one PO each side
-        std::vector<int> poVec1 = {po1};
-        std::vector<int> poVec2 = {po2};
-        auto out1 = simulateCircuit64(c1, topo1, piMasks1, poVec1);
-        auto out2 = simulateCircuit64(c2, topo2, piMasks2, poVec2);
-        uint64_t y1 = out1[0];
-        uint64_t y2 = out2[0];
-        if (inv) y2 = ~y2;
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& A, const auto& B) {
+                      if (A.first != B.first) return A.first < B.first;
+                      return A.second < B.second;
+                  });
 
-        if (y1 != y2) return false; // counterexample found
+        // Shuffle exact-score ties to avoid deterministic HK repetition.
+        size_t i = 0;
+        while (i < scored.size()) {
+            size_t j = i + 1;
+            while (j < scored.size() && scored[j].first == scored[i].first) j++;
+            if (j - i > 1) std::shuffle(scored.begin() + (long)i, scored.begin() + (long)j, rng);
+            i = j;
+        }
+
+        ord[po2].clear();
+        ord[po2].reserve(scored.size());
+        for (auto& pr : scored) ord[po2].push_back(pr.second);
     }
-    return true; // survived all batches (not proof, but strong filter)
+
+    return ord;
+}
+
+
+// ------------------------
+// PI candidates from PO map (plus bus restriction)
+// ------------------------
+static inline char swapPN(char r) {
+    r = normRel(r);
+    if (r == 'P') return 'N';
+    if (r == 'N') return 'P';
+    return r;
+}
+
+static inline bool relCompatible(char r1, char r2, bool rowFlip) {
+    r1 = normRel(r1);
+    r2 = normRel(r2);
+    if (!rowFlip) return r1 == r2;
+    // rowFlip means c2 PO is inverted => swap P/N on the c2-side relation.
+    r2 = swapPN(r2);
+    return r1 == r2;
+}
+
+static inline bool relCompatibleInv(char r1, char r2, bool rowFlip, bool piFlip) {
+    r1 = normRel(r1);
+    r2 = normRel(r2);
+    // rowFlip: c2 output inverted => swap P/N on c2 relation
+    if (rowFlip) r2 = swapPN(r2);
+    // piFlip: mapped PI is inverted => swap P/N on c2 relation
+    if (piFlip)  r2 = swapPN(r2);
+    return r1 == r2;
+}
+
+static bool buildPiCandidatesFromPoMap(const UnateTable& t1,
+                                       const UnateTable& t2,
+                                       const vector<int>& poMap,
+                                       const vector<char>& rowFlip,
+                                       const std::vector<std::vector<int>>& allowedPi1,
+                                       vector<vector<int>>& piCand,
+                                       vector<vector<uint8_t>>& piCandInvMask) {
+    const int nPO = t2.nPO;
+    const int nPI = t2.nPI;
+
+    piCand.assign(nPI, {});
+    piCandInvMask.assign(nPI, {});
+    for (int pi2 = 0; pi2 < nPI; pi2++) {
+        const std::vector<int>* allow = nullptr;
+        if (!allowedPi1.empty()) allow = &allowedPi1[pi2];
+
+        vector<int> cand;
+        cand.reserve(allow ? allow->size() : (size_t)nPI);
+
+        vector<uint8_t> invMask;
+        invMask.reserve(allow ? allow->size() : (size_t)nPI);
+
+        auto testOne = [&](int pi1) -> uint8_t {
+            bool ok0 = true; // no PI inversion on c2
+            bool ok1 = true; // PI inversion on c2
+            for (int po2 = 0; po2 < nPO; po2++) {
+                int po1 = poMap[po2];
+                if (po1 < 0) continue;
+                char a = t1.rel[po1][pi1];
+                char b = t2.rel[po2][pi2];
+                if (ok0 && !relCompatibleInv(a, b, rowFlip[po2], false)) ok0 = false;
+                if (ok1 && !relCompatibleInv(a, b, rowFlip[po2], true))  ok1 = false;
+                if (!ok0 && !ok1) return 0;
+            }
+            uint8_t m = 0;
+            if (ok0) m |= 1;
+            if (ok1) m |= 2;
+            return m;
+        };
+
+        if (allow) {
+            for (int pi1 : *allow) {
+                uint8_t m = testOne(pi1);
+                if (m) { cand.push_back(pi1); invMask.push_back(m); }
+            }
+        } else {
+            for (int pi1 = 0; pi1 < nPI; pi1++) {
+                uint8_t m = testOne(pi1);
+                if (m) { cand.push_back(pi1); invMask.push_back(m); }
+            }
+        }
+
+        piCand[pi2] = std::move(cand);
+        piCandInvMask[pi2] = std::move(invMask);
+        if (piCand[pi2].empty()) return false;
+    }
+    return true;
+}
+
+static vector<char> chooseRowFlipHeuristic(const UnateTable& t1,
+                                          const UnateTable& t2,
+                                          const vector<int>& poMap) {
+    vector<char> flip(t2.nPO, 0);
+    for (int po2 = 0; po2 < t2.nPO; po2++) {
+        int po1 = poMap[po2];
+        if (po1 < 0) continue;
+
+        int p1=0,n1=0,b1=0,i1=0;
+        int p2=0,n2=0,b2=0,i2=0;
+        for (int pi = 0; pi < t1.nPI; pi++) {
+            char a = normRel(t1.rel[po1][pi]);
+            if (a=='P') p1++; else if (a=='N') n1++; else if (a=='B') b1++; else i1++;
+        }
+        for (int pi = 0; pi < t2.nPI; pi++) {
+            char a = normRel(t2.rel[po2][pi]);
+            if (a=='P') p2++; else if (a=='N') n2++; else if (a=='B') b2++; else i2++;
+        }
+
+        int dNo = std::abs(p1 - p2) + std::abs(n1 - n2) + std::abs(b1 - b2) + std::abs(i1 - i2);
+        int dFl = std::abs(n1 - p2) + std::abs(p1 - n2) + std::abs(b1 - b2) + std::abs(i1 - i2);
+        flip[po2] = (dFl < dNo) ? 1 : 0;
+    }
+    return flip;
+}
+
+static vector<char> chooseRowFlipBySimOutputs(const std::vector<std::vector<uint64_t>>& outByBatch1,
+                                            const std::vector<std::vector<uint64_t>>& outByBatch2,
+                                            const vector<int>& poMap) {
+    // Decide per-PO inversion using simulation correlation:
+    // if y1 matches (~y2) better than y2, set flip=1.
+    const int batches = (int)outByBatch1.size();
+    const int nPO2 = (int)poMap.size();
+    vector<char> flip(nPO2, 0);
+    if (batches == 0) return flip;
+
+    for (int po2 = 0; po2 < nPO2; ++po2) {
+        int po1 = poMap[po2];
+        if (po1 < 0) continue;
+
+        int eq = 0;
+        int neq = 0;
+        for (int b = 0; b < batches; ++b) {
+            uint64_t y1 = outByBatch1[b][po1];
+            uint64_t y2 = outByBatch2[b][po2];
+            uint64_t x  = (y1 ^ y2);
+            int ne = popc64(x);
+            neq += ne;
+            eq  += (64 - ne);
+        }
+        flip[po2] = (neq > eq) ? 1 : 0;
+    }
+    return flip;
+}
+
+static bool randomPerfectMatchPI(const vector<vector<int>>& cand,
+                                 std::mt19937& rng,
+                                 vector<int>& matchPi2ToPi1) {
+    const int nPI = (int)cand.size();
+    matchPi2ToPi1.assign(nPI, -1);
+
+    vector<vector<int>> shuffled = cand;
+    for (int i = 0; i < nPI; i++) std::shuffle(shuffled[i].begin(), shuffled[i].end(), rng);
+
+    vector<int> order(nPI);
+    for (int i = 0; i < nPI; i++) order[i] = i;
+    std::shuffle(order.begin(), order.end(), rng);
+
+    vector<int> matchR(nPI, -1);
+
+    std::function<bool(int, vector<char>&)> dfs = [&](int u, vector<char>& vis) -> bool {
+        for (int v : shuffled[u]) {
+            if (vis[v]) continue;
+            vis[v] = 1;
+            if (matchR[v] == -1 || dfs(matchR[v], vis)) {
+                matchR[v] = u;
+                matchPi2ToPi1[u] = v;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (int u : order) {
+        vector<char> vis(nPI, 0);
+        if (!dfs(u, vis)) return false;
+    }
+    return true;
+}
+
+// After choosing a PI permutation (piMap), decide whether each c2 PI should be inverted.
+// piCandInvMask[pi2][k] is a bitmask for candidate pi1=piCand[pi2][k]:
+//   bit0: ok with no PI inversion, bit1: ok with PI inversion.
+// After choosing a PI permutation (piMap), decide whether each c2 PI should be inverted.
+// IMPORTANT: Many PI columns are ambiguous under reduced unate constraints; in that case
+// both inverted and non-inverted can be feasible. A greedy "prefer non-inverted" choice
+// can lock out the true solution and lead to satCalls=0 forever. We therefore RANDOMIZE
+// the choice when both are allowed.
+static bool derivePiFlipForMap(const vector<vector<int>>& piCand,
+                               const vector<vector<uint8_t>>& piCandInvMask,
+                               const vector<int>& piMap,
+                               std::mt19937& rng,
+                               vector<char>& piFlip) {
+    const int nPI = (int)piMap.size();
+    piFlip.assign(nPI, 0);
+    for (int pi2 = 0; pi2 < nPI; ++pi2) {
+        int pi1 = piMap[pi2];
+        uint8_t mask = 0;
+        const auto& cand = piCand[pi2];
+        const auto& msk  = piCandInvMask[pi2];
+        for (size_t i = 0; i < cand.size(); ++i) {
+            if (cand[i] == pi1) { mask = msk[i]; break; }
+        }
+        if (mask == 0) return false;
+
+        // mask bit0: ok without inversion, bit1: ok with inversion
+        if ((mask & 1) && (mask & 2)) {
+            // ambiguous -> explore both
+            piFlip[pi2] = (char)(rng() & 1U);
+        } else if (mask & 1) {
+            piFlip[pi2] = 0;
+        } else if (mask & 2) {
+            piFlip[pi2] = 1;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static MatchResult makeGuessFromMaps(const UnateTable& t1,
+                                    const UnateTable& t2,
+                                    const vector<int>& poMap,
+                                    const vector<char>& rowFlip,
+                                    const vector<int>& piMap,
+                                    const vector<char>& piFlip) {
+    MatchResult r;
+    r.success = false;
+
+    r.piPairs.reserve(t2.nPI);
+    for (int pi2 = 0; pi2 < t2.nPI; pi2++) {
+        int pi1 = piMap[pi2];
+        InPortMatch ip;
+        ip.c1_pi = t1.piNetIds[pi1];
+        ip.c2_pi = t2.piNetIds[pi2];
+        ip.c2Neg = (piFlip[pi2] != 0);
+        r.piPairs.push_back(ip);
+    }
+
+    r.poPairs.reserve(t2.nPO);
+    for (int po2 = 0; po2 < t2.nPO; po2++) {
+        int po1 = poMap[po2];
+        OutPortMatch op;
+        op.c1_po = t1.poNetIds[po1];
+        op.c2_po = t2.poNetIds[po2];
+        op.c2Neg = (rowFlip[po2] != 0);
+        r.poPairs.push_back(op);
+    }
+
+    return r;
+}
+
+// ------------------------
+// Witness pruning (CEGIS)
+// ------------------------
+struct WitnessBits {
+    // One counterexample assignment on c1 PIs (0/1 per PI).
+    std::vector<uint8_t> piVal1;
+};
+
+static inline uint64_t hashWitnessBits(const WitnessBits& w) {
+    // FNV-1a on the PI bitvector.
+    uint64_t h = 1469598103934665603ULL;
+    for (uint8_t b : w.piVal1) {
+        h ^= (uint64_t)(b & 1U);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static WitnessBits buildWitnessFromSat(const Circuit& c1,
+                                      const std::unordered_map<std::string,int>& c1PiWitness) {
+    WitnessBits w;
+    const int nPI = (int)c1.PIs.size();
+    w.piVal1.assign(nPI, 0);
+
+    std::unordered_map<std::string,int> piIdxByName;
+    piIdxByName.reserve((size_t)nPI * 2);
+    for (int i = 0; i < nPI; ++i) {
+        int netId = c1.PIs[i];
+        piIdxByName[c1.nets[netId].name] = i;
+    }
+
+    for (const auto& kv : c1PiWitness) {
+        auto it = piIdxByName.find(kv.first);
+        if (it == piIdxByName.end()) continue;
+        w.piVal1[it->second] = (uint8_t)(kv.second ? 1 : 0);
+    }
+    return w;
+}
+
+static inline uint64_t randU64(std::mt19937& rng) {
+    // mt19937 is 32-bit output; combine two draws.
+    uint64_t hi = (uint64_t)rng();
+    uint64_t lo = (uint64_t)rng();
+    return (hi << 32) | lo;
+}
+
+ 
+
+// Fast randomized simulation filter:
+// - Simulate 64 random patterns at once.
+// - If any PO mismatch under the proposed (poMap,piMap,rowFlip), extract ONE failing bit
+//   and add it as a new witness (single assignment) to prune future guesses.
+// Returns true if the mapping passes this random simulation batch.
+static bool passesRandomSimOrAddWitness(const Circuit& c1,
+                                       const Circuit& c2,
+                                       const vector<int>& topo1,
+                                       const vector<int>& topo2,
+                                       const vector<int>& poMap,
+                                       const vector<int>& piMap,
+                                       const vector<char>& rowFlip,
+                                       const vector<char>& piFlip,
+                                       std::mt19937& rng,
+                                       vector<WitnessBits>& witnesses,
+                                       std::unordered_set<uint64_t>& witnessHash,
+                                       int maxWitnesses) {
+    const int nPI1 = (int)c1.PIs.size();
+    const int nPI2 = (int)c2.PIs.size();
+    const int nPO2 = (int)c2.POs.size();
+
+    // Random 64-pattern PI masks on circuit1.
+    vector<uint64_t> piMask1(nPI1, 0);
+    for (int i = 0; i < nPI1; ++i) piMask1[i] = randU64(rng);
+
+    // Derive circuit2 PI masks by PI mapping.
+    vector<uint64_t> piMask2(nPI2, 0);
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        int pi1 = piMap[pi2];
+        uint64_t m = piMask1[pi1];
+        if (piFlip[pi2]) m = ~m;
+        piMask2[pi2] = m;
+    }
+
+    vector<uint64_t> out1 = simulateCircuit64(c1, topo1, piMask1, c1.POs);
+    vector<uint64_t> out2 = simulateCircuit64(c2, topo2, piMask2, c2.POs);
+
+    for (int po2 = 0; po2 < nPO2; ++po2) {
+        int po1 = poMap[po2];
+        uint64_t v1 = out1[po1];
+        uint64_t v2 = out2[po2];
+        if (rowFlip[po2]) v2 = ~v2;
+        uint64_t diff = (v1 ^ v2);
+        if (diff == 0) continue;
+
+        // Extract one failing bit position.
+        int bit = __builtin_ctzll(diff);
+        WitnessBits w;
+        w.piVal1.assign(nPI1, 0);
+        for (int i = 0; i < nPI1; ++i) {
+            w.piVal1[i] = (uint8_t)((piMask1[i] >> bit) & 1ULL);
+        }
+
+        if ((int)witnesses.size() < maxWitnesses) {
+            uint64_t hw = hashWitnessBits(w);
+            if (witnessHash.insert(hw).second) {
+                witnesses.push_back(std::move(w));
+                std::cerr << "[UnateBus] add SIM-witness#" << witnesses.size()
+                          << " badPo=(" << c1.nets[c1.POs[po1]].name
+                          << "," << c2.nets[c2.POs[po2]].name << ")\n";
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool passesAllWitnessesBatched(const Circuit& c1,
+                                      const Circuit& c2,
+                                      const vector<int>& topo1,
+                                      const vector<int>& topo2,
+                                      const vector<int>& poMap,
+                                      const vector<int>& piMap,
+                                      const vector<char>& rowFlip,
+                                      const vector<char>& piFlip,
+                                      const vector<WitnessBits>& witnesses) {
+    if (witnesses.empty()) return true;
+
+    const int nPO  = (int)c2.POs.size();
+    const int nPI1 = (int)c1.PIs.size();
+    const int nPI2 = (int)c2.PIs.size();
+
+    // Pack up to 64 witnesses into one 64-bit simulation batch.
+    for (size_t base = 0; base < witnesses.size(); base += 64) {
+        const size_t cnt = std::min<size_t>(64, witnesses.size() - base);
+        const uint64_t activeMask = (cnt == 64) ? ~0ULL : ((1ULL << cnt) - 1ULL);
+
+        vector<uint64_t> piMask1(nPI1, 0);
+        for (int pi1 = 0; pi1 < nPI1; ++pi1) {
+            uint64_t m = 0;
+            for (size_t k = 0; k < cnt; ++k) {
+                if (witnesses[base + k].piVal1[pi1] & 1U) m |= (1ULL << k);
+            }
+            piMask1[pi1] = m;
+        }
+
+        vector<uint64_t> piMask2(nPI2, 0);
+        for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+            int pi1 = piMap[pi2];
+            uint64_t m = piMask1[pi1];
+            if (piFlip[pi2]) m = ~m;
+            piMask2[pi2] = m;
+        }
+
+        vector<uint64_t> out1 = simulateCircuit64(c1, topo1, piMask1, c1.POs);
+        vector<uint64_t> out2 = simulateCircuit64(c2, topo2, piMask2, c2.POs);
+
+        for (int po2 = 0; po2 < nPO; ++po2) {
+            int po1 = poMap[po2];
+            uint64_t v1 = out1[po1];
+            uint64_t v2 = out2[po2];
+            if (rowFlip[po2]) v2 = ~v2;
+            uint64_t diff = (v1 ^ v2) & activeMask;
+            if (diff != 0) return false;
+        }
+    }
+
+    return true;
 }
 
 } // namespace
 
+MatchResult solveByUnateCEGIS(const Circuit& c1,
+                             const Circuit& c2,
+                             const BusInfo& b1,
+                             const BusInfo& b2,
+                             const std::string& unateCsv1,
+                             const std::string& unateCsv2,
+                             int busSamples,
+                             int maxCegisIters,
+                             int poTries,
+                             int piTriesPerPO,
+                             int seed) {
+    // If caller keeps the default (often 1), we can get "combo=1/1" and
+    // be stuck exploring a wrong bus-to-bus mapping forever. Since the number
+    // of buses is typically small, multi-sampling bus matchings is cheap and
+    // significantly increases robustness.
+    if (busSamples < 60) busSamples = 60;
 
+// Speed guard: avoid burning millions of PI tries on a fixed (wrong) PO mapping.
+// This cap does not affect correctness (SAT is still the final authority), it only changes exploration order.
+if (piTriesPerPO > 20000) piTriesPerPO = 20000;
 
-// Invert a TT while keeping the padding bits (beyond totalBits) masked to 0.
-static TT invertTT(const TT& in, int totalBits) {
-    TT out = in;
-    for (auto& x : out) x = ~x;
-    int pad = ((int)out.size() * 64) - totalBits;
-    if (pad > 0 && !out.empty()) {
-        uint64_t keep = (~0ULL) >> pad;
-        out.back() &= keep;
-    }
-    return out;
-}
-//---------------------------
-
-static vector<vector<int>> buildGroups(
-    const Circuit& c,
-    const BusInfo& bi,
-    const vector<int>& busIds,
-    const vector<int>& netsOfInterest
-) {
-    vector<vector<int>> groups;
-    groups.reserve(busIds.size() + netsOfInterest.size());
-
-    vector<char> covered((int)c.nets.size(), 0);
-
-    // existing bus groups
-    for (int bid : busIds) {
-        const auto& mem = bi.buses[bid].members;
-        groups.push_back(mem);
-        for (int nid : mem) {
-            if (nid >= 0 && nid < (int)covered.size()) covered[nid] = 1;
-        }
-    }
-
-    // singleton groups for nets not in any bus
-    for (int nid : netsOfInterest) {
-        if (nid >= 0 && nid < (int)covered.size() && !covered[nid]) {
-            groups.push_back(vector<int>{nid});
-            covered[nid] = 1;
-        }
-    }
-    return groups;
+static bool printedBanner = false;
+if (!printedBanner) {
+    printedBanner = true;
+    std::cerr << "[DBG][Match] UnateCEGIS"
+              << " busSamples=" << busSamples
+              << " poTries=" << poTries
+              << " piTriesPerPO=" << piTriesPerPO
+              << " maxIters=" << maxCegisIters
+              << " seed=" << seed
+              << "\n";
 }
 
 
-
-static unordered_map<int, vector<int>> groupBusesBySize(const vector<vector<int>>& groups) {
-    unordered_map<int, vector<int>> mp;
-    for (int gid = 0; gid < (int)groups.size(); gid++) {
-        mp[(int)groups[gid].size()].push_back(gid);
-    }
-    return mp;
-}
-
-static vector<int> keysSorted(const unordered_map<int, vector<int>>& mp) {
-    vector<int> keys;
-    keys.reserve(mp.size());
-    for (auto& kv : mp) keys.push_back(kv.first);
-    sort(keys.begin(), keys.end());
-    return keys;
-}
-
-MatchResult solveByBusTT(
-    const Circuit& c1, const BusInfo& b1,
-    const Circuit& c2, const BusInfo& b2,
-    int maxPI
-) {
     MatchResult best;
+    best.success = false;
+    best.msg = "No solution tried yet.";
 
-    // ---- collect PI buses / PO buses ----
-    vector<int> inBus1  = filterBusIdsByType(c1, b1, true,  false);
-    vector<int> outBus1 = filterBusIdsByType(c1, b1, false, true);
-    vector<int> inBus2  = filterBusIdsByType(c2, b2, true,  false);
-    vector<int> outBus2 = filterBusIdsByType(c2, b2, false, true);
-
-    auto inGroups1  = buildGroups(c1, b1, inBus1,  c1.PIs);
-    auto inGroups2  = buildGroups(c2, b2, inBus2,  c2.PIs);
-    auto outGroups1 = buildGroups(c1, b1, outBus1, c1.POs);
-    auto outGroups2 = buildGroups(c2, b2, outBus2, c2.POs);
-
-    auto in1  = groupBusesBySize(inGroups1);
-    auto in2  = groupBusesBySize(inGroups2);
-    auto out1 = groupBusesBySize(outGroups1);
-    auto out2 = groupBusesBySize(outGroups2);
-
-
-    // sanity: same size categories exist
-    // if (in1.size() != in2.size()) return best;
-    // if (out1.size() != out2.size()) return best;
-
-    // ---- decide abstract PI order = c1 PI buses in the order they appear in inBus1 ----
-    vector<int> absPiNetsC1;
-    for (const auto& g : inGroups1) {
-        for (int nid : g) absPiNetsC1.push_back(nid);
+    if (c1.PIs.size() != c2.PIs.size() || c1.POs.size() != c2.POs.size()) {
+        best.msg = "PI/PO count mismatch: c1 has PI=" + std::to_string(c1.PIs.size()) +
+                   " PO=" + std::to_string(c1.POs.size()) + ", c2 has PI=" +
+                   std::to_string(c2.PIs.size()) + " PO=" + std::to_string(c2.POs.size());
+        return best;
     }
 
-    int nAbsPI = (int)absPiNetsC1.size();
-    if (nAbsPI > maxPI) return best;
+    UnateTable t1 = UnateTable::loadFromCSV(unateCsv1, c1);
+    UnateTable t2 = UnateTable::loadFromCSV(unateCsv2, c2);
 
-    // abstract idx map for c1
-    unordered_map<int,int> c1PiNetToAbs;
-    for (int i = 0; i < nAbsPI; i++) c1PiNetToAbs[absPiNetsC1[i]] = i;
+    // PI column reduced-key signature (P/N merged) is invariant to both PO/PI inversion.
+    // Use it as a cheap hard filter to shrink candidate sets.
+    const auto piKey1 = computeColReducedKeys(t1);
+    const auto piKey2 = computeColReducedKeys(t2);
 
-    // precompute PI patterns and topo
-    auto piPatterns = buildPiPatterns(nAbsPI);
-    auto topo1 = topoSortGates(c1);
-    auto topo2 = topoSortGates(c2);
+    const int nPO = t2.nPO;
+    const int nPI = t2.nPI;
 
-    // precompute c1 PO truth tables once
-    auto tt1_pos = simulateCircuitTT(c1, topo1, piPatterns, c1PiNetToAbs, c1.POs);
+    // topo order for fast 64-bit simulation
+    vector<int> topo1 = topoSortGates(c1);
+    vector<int> topo2 = topoSortGates(c2);
 
-    // helper: map PO net -> index
-    unordered_map<int,int> c1PoIdx, c2PoIdx;
-    for (int i = 0; i < (int)c1.POs.size(); i++) c1PoIdx[c1.POs[i]] = i;
-    for (int i = 0; i < (int)c2.POs.size(); i++) c2PoIdx[c2.POs[i]] = i;
+    std::mt19937 rng((seed == 0) ? std::random_device{}() : (unsigned)seed);
 
-    // ---- enumerate input bus bijection by size ----
-    vector<int> inSizes = keysSorted(in1);
+    // ------------------------
+    // Influence signatures (simulation-based, inversion/perm invariant)
+    // ------------------------
+    // Use the same random PI masks for c1/c2 to reduce sampling noise.
+    const int sigBatches = 64; // 64*64 = 4096 random samples
+    std::mt19937 rngSig((seed == 0) ? 0xC0FFEEu : (unsigned)(seed ^ 0x9E3779B9u));
 
-    vector<pair<int,int>> chosenInBusPairs; // (groupId1, groupId2)
+    std::vector<std::vector<uint64_t>> sigMasks((size_t)sigBatches, std::vector<uint64_t>((size_t)nPI, 0));
+    for (int b = 0; b < sigBatches; ++b) {
+        for (int pi = 0; pi < nPI; ++pi) sigMasks[b][pi] = randU64(rngSig);
+    }
 
-    function<bool(int)> dfsInputSize = [&](int si) -> bool {
-        if (si == (int)inSizes.size()) {
-            // We now have bus-to-bus pairs for inputs. Enumerate within-bus permutations.
+    // Baseline PO outputs for correlation signature and for influence computation.
+    std::vector<std::vector<uint64_t>> outByBatch1, outByBatch2;
+    computePOBaselineOutputsSharedMasks(c1, topo1, sigMasks, outByBatch1);
+    computePOBaselineOutputsSharedMasks(c2, topo2, sigMasks, outByBatch2);
 
-            // build per-bus member lists in matching order
-            vector<vector<int>> c1BusMembers, c2BusMembers;
-            c1BusMembers.reserve(chosenInBusPairs.size());
-            c2BusMembers.reserve(chosenInBusPairs.size());
-            for (auto& bp : chosenInBusPairs) {
-                c1BusMembers.push_back(inGroups1[bp.first]);
-                c2BusMembers.push_back(inGroups2[bp.second]);
+    std::vector<InfluenceSig> poInf1, poInf2, piInf1, piInf2;
+    computeInfluenceSigsSharedMasks(c1, topo1, sigMasks, outByBatch1, poInf1, &piInf1);
+    computeInfluenceSigsSharedMasks(c2, topo2, sigMasks, outByBatch2, poInf2, &piInf2);
+
+    // Output-output correlation signature (top-K corrAbs values) per PO.
+    std::vector<CorrSig> poCorr1, poCorr2;
+    computePOCorrSigsFromOutputs(outByBatch1, poCorr1);
+    computePOCorrSigsFromOutputs(outByBatch2, poCorr2);
+
+    // ------------------------
+    // (1) Build bus groups & bus mapping samples (input buses and output buses separately)
+    // ------------------------
+    std::vector<PortBusGroup> inB1, inB2, outB1, outB2;
+    std::vector<int> inNon1, inNon2, outNon1, outNon2;
+
+    extractBusGroups(c1, b1, t1, true,  inB1,  inNon1);
+    extractBusGroups(c2, b2, t2, true,  inB2,  inNon2);
+    extractBusGroups(c1, b1, t1, false, outB1, outNon1);
+    extractBusGroups(c2, b2, t2, false, outB2, outNon2);
+
+    std::cerr << "[DBG][Bus] detected buses: in(c1,c2)=(" << inB1.size() << "," << inB2.size()
+              << ") out(c1,c2)=(" << outB1.size() << "," << outB2.size()
+              << ") nonBus in(c1,c2)=(" << inNon1.size() << "," << inNon2.size()
+              << ") out(c1,c2)=(" << outNon1.size() << "," << outNon2.size() << ")\n";
+
+    // Hard constraint: bused ports must map to bused ports, and buses must map 1-1.
+    if (inB1.size() != inB2.size() || outB1.size() != outB2.size()) {
+        best.msg = "Bus group count mismatch (inputBus: c1=" + std::to_string(inB1.size()) +
+                   " c2=" + std::to_string(inB2.size()) + ", outputBus: c1=" +
+                   std::to_string(outB1.size()) + " c2=" + std::to_string(outB2.size()) + ")";
+        return best;
+    }
+
+    // Another quick sanity: non-bus ports count must match too (otherwise strict bus constraint impossible)
+    if (inNon1.size() != inNon2.size() || outNon1.size() != outNon2.size()) {
+        best.msg = "Non-bus port count mismatch under strict bus constraint (inputNon: c1=" +
+                   std::to_string(inNon1.size()) + " c2=" + std::to_string(inNon2.size()) +
+                   ", outputNon: c1=" + std::to_string(outNon1.size()) + " c2=" +
+                   std::to_string(outNon2.size()) + ")";
+        return best;
+    }
+
+    // Build bus adjacency and sample matchings.
+    std::vector<std::vector<int>> inAdj, outAdj;
+    const int topKBus = 6; // small: keep graph sparse but flexible
+
+    std::vector<std::vector<int>> inBusMatchings;
+    if (!inB2.empty()) {
+        if (!buildBusAdj(inB1, inB2, topKBus, inAdj)) {
+            best.msg = "Failed to build input-bus adjacency (width/signature mismatch?)";
+            return best;
+        }
+        // If bus count is small, enumerate multiple matchings directly.
+        // This avoids collapsing to a single matching when only HK is used.
+        if ((int)inB2.size() <= 8) {
+            inBusMatchings = enumerateBusMatchingsSmall(inAdj, (int)inB1.size(), std::max(1, busSamples), rng);
+        } else {
+            inBusMatchings = sampleBusMatchings(inAdj, (int)inB1.size(), std::max(1, busSamples), rng);
+        }
+        if (inBusMatchings.empty()) {
+            best.msg = "No perfect input-bus matching found under constraints.";
+            return best;
+        }
+    } else {
+        inBusMatchings.push_back(std::vector<int>());
+    }
+
+    std::vector<std::vector<int>> outBusMatchings;
+    if (!outB2.empty()) {
+        if (!buildBusAdj(outB1, outB2, topKBus, outAdj)) {
+            best.msg = "Failed to build output-bus adjacency (width/signature mismatch?)";
+            return best;
+        }
+        // If bus count is small, enumerate multiple matchings directly.
+        if ((int)outB2.size() <= 8) {
+            outBusMatchings = enumerateBusMatchingsSmall(outAdj, (int)outB1.size(), std::max(1, busSamples), rng);
+        } else {
+            outBusMatchings = sampleBusMatchings(outAdj, (int)outB1.size(), std::max(1, busSamples), rng);
+        }
+        if (outBusMatchings.empty()) {
+            best.msg = "No perfect output-bus matching found under constraints.";
+            return best;
+        }
+    } else {
+        outBusMatchings.push_back(std::vector<int>());
+    }
+
+    std::cerr << "[DBG][Bus] busMatchings sizes: in=" << inBusMatchings.size()
+              << " out=" << outBusMatchings.size() << " (effective busSamples=" << busSamples << ")\n";
+
+    // Build a list of (inIdx, outIdx) combos, then try up to busSamples combos.
+    std::vector<std::pair<int,int>> combos;
+    for (int i = 0; i < (int)inBusMatchings.size(); i++) {
+        for (int j = 0; j < (int)outBusMatchings.size(); j++) {
+            combos.push_back({i,j});
+        }
+    }
+    std::shuffle(combos.begin(), combos.end(), rng);
+    if ((int)combos.size() > busSamples) combos.resize(busSamples);
+
+    // ------------------------
+    // CEGIS state
+    // ------------------------
+    const int kMaxWitnesses = 256;
+    vector<WitnessBits> witnesses;
+    witnesses.reserve((size_t)kMaxWitnesses);
+    std::unordered_set<uint64_t> witnessHash;
+    witnessHash.reserve(512);
+
+    uint64_t satCalls = 0;
+    uint64_t simReject = 0;
+    uint64_t witnessReject = 0;
+    uint64_t hkFailPO = 0;
+    uint64_t hkFailPI = 0;
+    uint64_t buildPiFail = 0;
+    uint64_t randPiFail = 0;
+    uint64_t triesTotal = 0;
+    auto tGlobalStart = std::chrono::steady_clock::now();
+    auto tLastLog = tGlobalStart;
+
+    MatchResult lastTried;
+    SatCheckResult lastSat;
+
+    // ------------------------
+    // (2) For each sampled bus mapping, run the usual PO/PI matching + SAT CEGIS
+    // ------------------------
+    for (int comboIdx = 0; comboIdx < (int)combos.size(); comboIdx++) {
+        const auto [iIn, iOut] = combos[comboIdx];
+
+        uint64_t triesCombo = 0;
+        int curIt = -1;
+        int curKpo = -1;
+
+// If HK keeps returning the same PO matching, don't spend too long re-trying PI permutations for it.
+std::unordered_map<uint64_t, int> poMapRepeat;
+poMapRepeat.reserve(4096);
+
+        // busId maps (size = b2.buses.size())
+        std::vector<int> inBusIdMap2to1;
+        if (!inB2.empty()) {
+            inBusIdMap2to1 = toBusIdMap(b2, inB1, inB2, inBusMatchings[iIn]);
+        } else {
+            inBusIdMap2to1.assign((int)b2.buses.size(), -1);
+        }
+
+        std::vector<int> outBusIdMap2to1;
+        if (!outB2.empty()) {
+            outBusIdMap2to1 = toBusIdMap(b2, outB1, outB2, outBusMatchings[iOut]);
+        } else {
+            outBusIdMap2to1.assign((int)b2.buses.size(), -1);
+        }
+
+        // allowed candidates per port (idx-based)
+        std::vector<std::vector<int>> allowedPo1, allowedPi1;
+        if (!buildAllowedByBus(c1, c2, b1, b2, t1, t2, false, outBusIdMap2to1, allowedPo1)) {
+            continue;
+        }
+        if (!buildAllowedByBus(c1, c2, b1, b2, t1, t2, true,  inBusIdMap2to1, allowedPi1)) {
+            continue;
+        }
+
+        // Hard prune PI candidates by inversion-invariant column signature.
+        // (P/N merged into U) => safe under input negation.
+        bool piKeyOk = true;
+        for (int pi2 = 0; pi2 < nPI; ++pi2) {
+            auto& vec = allowedPi1[pi2];
+            vec.erase(std::remove_if(vec.begin(), vec.end(), [&](int pi1){
+                return piKey1[pi1] != piKey2[pi2];
+            }), vec.end());
+            if (vec.empty()) { piKeyOk = false; break; }
+        }
+        if (!piKeyOk) continue;
+
+        // Soft-prune PI candidates by inverter-invariant influence signature
+        // (helps when unate table is mostly binate and provides weak guidance).
+        {
+            const int kKeep = 24; // keep top-K candidates per PI2
+            pruneAllowedPiByInfluenceSig(piInf1, piInf2, allowedPi1, kKeep, rng);
+            bool ok = true;
+            for (int pi2 = 0; pi2 < nPI; ++pi2) {
+                if (allowedPi1[pi2].empty()) { ok = false; break; }
+            }
+            if (!ok) continue;
+        }
+
+
+        // Build PO ordering (restricted by bus)
+        vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, poInf1, poInf2, poCorr1, poCorr2, rng);
+
+        auto tryOneGuess = [&](int Kpo) -> bool {
+            vector<vector<int>> adjPO(nPO);
+            for (int po2 = 0; po2 < nPO; po2++) {
+                int k = std::min(Kpo, (int)poOrd[po2].size());
+                adjPO[po2].assign(poOrd[po2].begin(), poOrd[po2].begin() + k);
             }
 
-            // build list of permutations for each c2 bus
-            vector<vector<vector<int>>> perms;
-            perms.reserve(c2BusMembers.size());
-            for (auto mem : c2BusMembers) {
-                sort(mem.begin(), mem.end());
-                vector<vector<int>> ps;
-                do { ps.push_back(mem); } while (next_permutation(mem.begin(), mem.end()));
-                perms.push_back(ps);
+            vector<int> poMap;
+            if (!hopcroftKarp(adjPO, nPO, poMap)) { hkFailPO++; return false; }
+
+// Skip overly repeated PO maps (usually caused by near-deterministic HK on similar candidate lists).
+// This forces the outer loop to reshuffle PO candidate prefixes and/or increase Kpo.
+{
+    uint64_t hpo = hashMatching(poMap);
+    int &cnt = poMapRepeat[hpo];
+    cnt++;
+    if (cnt > 12) {
+        return false;
+    }
+}
+
+            vector<char> rowFlip = chooseRowFlipBySimOutputs(outByBatch1, outByBatch2, poMap);
+
+            vector<vector<int>> piCand;
+            vector<vector<uint8_t>> piCandInvMask;
+            if (!buildPiCandidatesFromPoMap(t1, t2, poMap, rowFlip, allowedPi1, piCand, piCandInvMask)) {
+                buildPiFail++; return false;
             }
 
-            vector<int> idx(perms.size(), 0);
-            while (true) {
-                // build c2 PI net -> abstract idx according to current permutation selection
-                unordered_map<int,int> c2PiNetToAbs;
-                vector<pair<int,int>> piPairs;
-                piPairs.reserve(nAbsPI);
+            vector<int> piMapHK;
+            if (!hopcroftKarp(piCand, nPI, piMapHK)) { hkFailPI++; return false; }
 
-                for (size_t k = 0; k < perms.size(); k++) {
-                    const auto& A = c1BusMembers[k];
-                    const auto& B = perms[k][idx[k]];
-                    for (size_t t = 0; t < A.size(); t++) {
-                        int pi1 = A[t];
-                        int pi2 = B[t];
-                        c2PiNetToAbs[pi2] = c1PiNetToAbs[pi1];
-                        piPairs.push_back({pi1, pi2});
+            // Dynamic stall window: if we keep rejecting without learning a new witness,
+            // stop burning PI tries on this fixed PO-map and move on.
+            size_t   stallWSize = witnesses.size();
+            uint64_t stallRej   = witnessReject + simReject;
+
+            for (int attempt = 0; attempt < piTriesPerPO; attempt++) {
+                vector<int> piMap = piMapHK;
+                if (!randomPerfectMatchPI(piCand, rng, piMap)) { randPiFail++; continue; }
+
+                vector<char> piFlip;
+                if (!derivePiFlipForMap(piCand, piCandInvMask, piMap, rng, piFlip)) { randPiFail++; continue; }
+
+                MatchResult guess = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip);
+                lastTried = guess;
+
+                triesTotal++;
+                triesCombo++;
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - tLastLog).count() >= 1) {
+                        tLastLog = now;
+                        using namespace std::chrono;
+                        auto sec = duration_cast<duration<double>>(now - tGlobalStart).count();
+                        std::cerr << "[PROG] combo=" << comboIdx+1 << "/" << combos.size()
+                                  << " it=" << curIt << " Kpo=" << curKpo
+                                  << " triesCombo=" << triesCombo
+                                  << " triesTotal=" << triesTotal
+                                  << " satCalls=" << satCalls
+                                  << " simReject=" << simReject
+                                  << " witReject=" << witnessReject
+                                  << " hkPO=" << hkFailPO
+                                  << " hkPI=" << hkFailPI
+                                  << " buildPiFail=" << buildPiFail
+                                  << " randPiFail=" << randPiFail
+                                  << " witnesses=" << witnesses.size()
+                                  << " t=" << sec << "s\n";
                     }
                 }
 
-                // simulate c2 POs with this PI mapping
-                auto tt2_pos = simulateCircuitTT(c2, topo2, piPatterns, c2PiNetToAbs, c2.POs);
-
-                // ---- enumerate output bus bijection + within-bus permutations, and test all PO pairs ----
-                vector<int> outSizes = keysSorted(out1);
-                vector<pair<int,int>> chosenOutBusPairs; // (groupId1, groupId2)
-
-                function<bool(int)> dfsOutSize = [&](int osi) -> bool {
-                    if (osi == (int)outSizes.size()) {
-                        // enumerate within-bus permutations
-                        vector<vector<int>> o1m, o2m;
-                        o1m.reserve(chosenOutBusPairs.size());
-                        o2m.reserve(chosenOutBusPairs.size());
-                        for (auto& bp : chosenOutBusPairs) {
-                            o1m.push_back(outGroups1[bp.first]);
-                            o2m.push_back(outGroups2[bp.second]);
-                        }
-
-                        vector<vector<vector<int>>> operms;
-                        operms.reserve(o2m.size());
-                        for (auto mem : o2m) {
-                            sort(mem.begin(), mem.end());
-                            vector<vector<int>> ps;
-                            do { ps.push_back(mem); } while (next_permutation(mem.begin(), mem.end()));
-                            operms.push_back(ps);
-                        }
-
-                        vector<int> oidx(operms.size(), 0);
-                        while (true) {
-                            bool ok = true;
-                            vector<MatchResult::OutPair> poPairs;
-                            poPairs.reserve(c1.POs.size());
-
-                            // 這個 totalBits 是 2^nAbsPI
-                            const int totalBits = (int)piPatterns.size();
-
-                            for (size_t k = 0; k < operms.size(); k++) {
-                                const auto& A = o1m[k];
-                                const auto& B = operms[k][oidx[k]];
-                                for (size_t t = 0; t < A.size(); t++) {
-                                    int po1 = A[t];
-                                    int po2 = B[t];
-                                    // poPairs.push_back({po1, po2});
-
-                                    const TT& T1 = tt1_pos[c1PoIdx[po1]];
-                                    const TT& T2 = tt2_pos[c2PoIdx[po2]];
-                                    MatchResult::OutPair op;
-                                    op.c1_po = po1;
-                                    op.c2_po = po2;
-                                    op.c1Neg = false;
-                                    op.c2Neg = false;
-
-                                    if (sameTT(T1, T2)) {
-                                        op.c2Neg = false;
-                                    } else {
-                                        TT invT2 = invertTT(T2, totalBits);
-                                        if (sameTT(T1, invT2)) {
-                                            op.c2Neg = true;
-                                        } else {
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-
-                                    poPairs.push_back(op);
-                                }
-                                if (!ok) break;
-                            }
-
-                            if (ok) {
-                                best.piPairs = piPairs;
-                                best.poPairs = poPairs;
-                                best.success = true;
-                                return true;
-                            }
-
-                            // next oidx
-                            int p = (int)oidx.size() - 1;
-                            while (p >= 0) {
-                                oidx[p]++;
-                                if (oidx[p] < (int)operms[p].size()) break;
-                                oidx[p] = 0;
-                                p--;
-                            }
-                            if (p < 0) break;
-                        }
-                        return false;
-                    }
-
-                    int sz = outSizes[osi];
-                    auto L = out1.at(sz);
-                    auto R = out2.at(sz);
-
-                    sort(R.begin(), R.end());
-                    do {
-                        int base = (int)chosenOutBusPairs.size();
-                        for (size_t i = 0; i < L.size(); i++) {
-                            chosenOutBusPairs.push_back(std::make_pair(L[i], R[i]));
-                        }
-                        if (dfsOutSize(osi + 1)) return true;
-                        chosenOutBusPairs.resize(base);
-                    } while (next_permutation(R.begin(), R.end()));
-
-                    return false;
-                };
-
-                if (dfsOutSize(0)) return true;
-
-                // next input-perm selection idx
-                int p = (int)idx.size() - 1;
-                while (p >= 0) {
-                    idx[p]++;
-                    if (idx[p] < (int)perms[p].size()) break;
-                    idx[p] = 0;
-                    p--;
+                // Stall guard: if we keep failing for a long time *without adding new witnesses*,
+                // we are likely stuck on a wrong PO-map (or wrong polarity choice). Move on.
+                if (witnesses.size() != stallWSize) {
+                    stallWSize = witnesses.size();
+                    stallRej = witnessReject + simReject;
+                } else if ((witnessReject + simReject - stallRej) >= 30000) {
+                    std::cerr << "[STALL] give-up PI tries (no new witness)"
+                              << " rej=" << (witnessReject + simReject - stallRej)
+                              << " w=" << witnesses.size()
+                              << " poRep=" << poMapRepeat[hashMatching(poMap)]
+                              << " Kpo=" << curKpo
+                              << " it=" << curIt
+                              << "\n";
+                    break;
                 }
-                if (p < 0) break;
+
+                if (!passesAllWitnessesBatched(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip, witnesses)) {
+                    witnessReject++;
+                    continue;
+                }
+
+                // Extra cheap pruning: 64-pattern random simulation.
+                // If it fails, we extract ONE failing bit as a witness (CEGIS) and skip SAT.
+                if (!passesRandomSimOrAddWitness(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip,
+                                               rng, witnesses, witnessHash, kMaxWitnesses)) {
+                    simReject++;
+                    continue;
+                }
+
+                satCalls++;
+                {
+                    using namespace std::chrono;
+                    auto now = steady_clock::now();
+                    auto sec = duration_cast<duration<double>>(now - tGlobalStart).count();
+                    std::cerr << "[SAT] start call=" << satCalls
+                              << " witnesses=" << witnesses.size()
+                              << " simReject=" << simReject
+                              << " t=" << sec << "s\n";
+                }
+
+                auto tSat0 = std::chrono::steady_clock::now();
+                SatCheckResult satRes = checkMatchBySAT(c1, c2, guess);
+                auto tSat1 = std::chrono::steady_clock::now();
+                {
+                    using namespace std::chrono;
+                    auto ms = duration_cast<milliseconds>(tSat1 - tSat0).count();
+                    std::cerr << "[SAT] end   call=" << satCalls
+                              << " ok=" << (satRes.success ? 1 : 0)
+                              << " ms=" << ms
+                              << " badPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
+                }
+                lastSat = satRes;
+                if (satRes.success) {
+                    guess.success = true;
+                    guess.msg = "SAT UNSAT miter: equivalent mapping found.";
+                    best = guess;
+                    return true;
+                }
+
+                // de-dup witnesses
+                {
+                    WitnessBits w = buildWitnessFromSat(c1, satRes.c1PiWitness);
+                    uint64_t h = hashWitnessBits(w);
+                    if ((int)witnesses.size() < kMaxWitnesses && witnessHash.insert(h).second) {
+                        witnesses.push_back(std::move(w));
+                        std::cerr << "[UnateBus] add SAT-witness#" << witnesses.size()
+                                  << " badPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
+                    }
+                }
             }
 
             return false;
-        }
-
-        int sz = inSizes[si];
-
-        // need both sides have same number of buses for this size
-        auto itL = in1.find(sz); 
-        auto itR = in2.find(sz);
-        if (itL == in1.end() || itR == in2.end()) return false;
-        const auto& L0 = itL->second;
-        const auto& R0 = itR->second;
-        // if (L0.size() != R0.size()) return false;
-
-        auto L = L0;
-        auto R = R0;
-
-        sort(R.begin(), R.end());
-        do {
-            int base = (int)chosenInBusPairs.size();
-            for (size_t i = 0; i < L.size(); i++) {
-                chosenInBusPairs.push_back(std::make_pair(L[i], R[i]));
-            }
-            if (dfsInputSize(si + 1)) return true;
-            chosenInBusPairs.resize(base);
-        } while (next_permutation(R.begin(), R.end()));
-
-        return false;
-    };
-
-    dfsInputSize(0);
-    return best;
-}
-
-
-//------------------------------
-// big case
-//------------------------------
-// step 1: build signatures
-struct POSig {
-    // sig[poIndex][batch] = uint64_t mask
-    std::vector<std::vector<uint8_t>> ones;
-};
-
-static POSig buildPOSignature(const Circuit& c, const std::vector<int>& topo,
-                              int batches, uint64_t seed) {
-    POSig out;
-    out.ones.assign(c.POs.size(), std::vector<uint8_t>());
-
-    std::vector<uint64_t> piMasks(c.PIs.size(), 0);
-    for (int b = 0; b < batches; b++) {
-        uint64_t s = seed + 0x1000003ULL * (uint64_t)b;
-
-        // 每個 PI 一個 64-bit mask（64 個 patterns）
-        for (size_t i = 0; i < c.PIs.size(); i++) {
-            piMasks[i] = splitmix64(s);
-        }
-
-        // 一次模擬拿到「所有 PO」的 64-bit 輸出
-        std::vector<uint64_t> poMasks = simulateCircuit64(c, topo, piMasks, c.POs);
-
-        for (size_t po = 0; po < poMasks.size(); po++) {
-            uint8_t cnt = (uint8_t)__builtin_popcountll(poMasks[po]);
-            out.ones[po].push_back(cnt);   // <<< 就是這一行
-        }
-
-
-        // debug
-        // if (b == 0) {
-        //     uint64_t m = poMasks[0];
-        //     std::cerr << "[DBG][Sig] first PO=" << c.nets[c.POs[0]].name
-        //             << " popcnt=" << __builtin_popcountll(m) << "/64"
-        //             << " mask=" << std::hex << m << std::dec << "\n";
-        // }
-        // debug end
-    }
-
-    // debug
-    // std::cerr << "[DBG][Sig] batches=" << batches
-    //           << " PO count=" << out.ones.size()
-    //           << " siglen=" << (out.ones.empty() ? 0 : out.ones[0].size())
-    //           << "\n";
-    // for (int i = 0; i < (int)out.ones.size() && i < 3; i++) {
-    //     std::cerr << "  PO[" << i << "] ones: ";
-    //     for (auto v : out.ones[i]) std::cerr << (int)v << " ";
-    //     std::cerr << "\n";
-    // }
-    // debug end
-
-    return out;
-}
-
-// step 2: build candidates
-// p-vector distance (L1) with optional inversion
-static void distancePO_pvec(const std::vector<uint8_t>& o1,
-                            const std::vector<uint8_t>& o2,
-                            int& dSame, int& dInv) {
-    dSame = 0; dInv = 0;
-    for (size_t i = 0; i < o1.size(); i++) {
-        int a = (int)o1[i];
-        int b = (int)o2[i];
-        dSame += std::abs(a - b);
-        dInv  += std::abs(a - (64 - b));
-    }
-}
-
-struct POCand { int po2; bool inv; int score; };
-
-static std::vector<std::vector<POCand>>
-buildPOCandidates(const Circuit& c1, const POSig& s1,
-                  const Circuit& c2, const POSig& s2,
-                  int K, int threshold) {
-    std::vector<std::vector<POCand>> cands(c1.POs.size());
-
-    for (size_t i = 0; i < c1.POs.size(); i++) {
-        std::vector<POCand> tmp;
-        tmp.reserve(c2.POs.size());
-
-        int bestSame = 1e9, bestInv = 1e9, bestMin = 1e9;
-        int bestJ_same = -1, bestJ_inv = -1, bestJ_min = -1;
-        bool bestMinInv = false;
-
-        for (size_t j = 0; j < c2.POs.size(); j++) {
-            int dSame, dInv;
-            distancePO_pvec(s1.ones[i], s2.ones[j], dSame, dInv);
-            int best = std::min(dSame, dInv);
-            bool inv = (dInv < dSame);
-
-            // 先用 threshold 過濾（你也可以先暫時不濾，方便 debug）
-            if (best <= threshold) tmp.push_back({(int)j, inv, best});
-
-            // debug: track global best for this po1
-            if (dSame < bestSame) { bestSame = dSame; bestJ_same = (int)j; }
-            if (dInv  < bestInv)  { bestInv  = dInv;  bestJ_inv  = (int)j; }
-            if (best  < bestMin)  { bestMin  = best;  bestJ_min  = (int)j; bestMinInv = inv; }
-        }
-
-        std::sort(tmp.begin(), tmp.end(),
-                  [](const POCand& a, const POCand& b){ return a.score < b.score; });
-        if ((int)tmp.size() > K) tmp.resize(K);
-        cands[i] = std::move(tmp);
-
-        // debug only for first po1
-        // if (i == 0) {
-        //     std::cerr << "[DBG][POCand] po1=" << c1.nets[c1.POs[i]].name << "\n";
-        //     std::cerr << "  bestSame=" << bestSame
-        //               << " with po2=" << (bestJ_same>=0 ? c2.nets[c2.POs[bestJ_same]].name : "NA") << "\n";
-        //     std::cerr << "  bestInv =" << bestInv
-        //               << " with po2=" << (bestJ_inv>=0 ? c2.nets[c2.POs[bestJ_inv]].name : "NA") << "\n";
-        //     std::cerr << "  bestMin =" << bestMin
-        //               << " inv=" << bestMinInv
-        //               << " with po2=" << (bestJ_min>=0 ? c2.nets[c2.POs[bestJ_min]].name : "NA") << "\n";
-        //     std::cerr << "  candidates kept=" << cands[i].size() << "\n";
-        // }
-        // if (i == 0) {
-        //     std::cerr << "[DBG][POCand-ALL] po1="
-        //             << c1.nets[c1.POs[i]].name << "\n";
-
-        //     for (size_t j = 0; j < c2.POs.size(); j++) {
-        //         int dSame, dInv;
-        //         distancePO_pvec(s1.ones[i], s2.ones[j], dSame, dInv);
-        //         int best = std::min(dSame, dInv);
-        //         bool inv = (dInv < dSame);
-
-        //         std::cerr << "  po2="
-        //                 << c2.nets[c2.POs[j]].name
-        //                 << "  dSame=" << dSame
-        //                 << "  dInv=" << dInv
-        //                 << "  best=" << best
-        //                 << "  inv=" << inv
-        //                 << "\n";
-        //     }
-        // }
-        // debug end
-    }
-
-    return cands;
-}
-
-
-// step 3: solve by candidates
-// MatchResult solveByPOSignatureBaseline(
-//     const Circuit& c1, const Circuit& c2,
-//     int batches, int K, int threshold
-// ) {
-//     MatchResult res;
-//     auto topo1 = topoSortGates(c1);
-//     auto topo2 = topoSortGates(c2);
-
-//     POSig sig1 = buildPOSignature(c1, topo1, batches, 12345);
-//     POSig sig2 = buildPOSignature(c2, topo2, batches, 98765);
-
-//     auto cands = buildPOCandidates(c1, sig1, c2, sig2, K, threshold);
-
-//     std::vector<char> po2_taken(c2.POs.size(), 0);
-
-//     // 先簡單：每個 po1 試它的候選，找到第一個沒被占用的
-//     for (size_t i = 0; i < c1.POs.size(); i++) {
-//         for (auto& cd : cands[i]) {
-//             if (po2_taken[cd.po2]) continue;
-//             po2_taken[cd.po2] = 1;
-
-//             MatchResult::OutPair op;
-//             op.c1_po = c1.POs[i];
-//             op.c2_po = c2.POs[cd.po2];
-//             op.c2Neg = cd.inv; // 反相就輸出 '-'
-//             res.poPairs.push_back(op);
-//             // debug
-//             std::cerr << "  match "
-//                     << c1.nets[op.c1_po].name
-//                     << " <-> "
-//                     << (op.c2Neg ? "-" : "+")
-//                     << c2.nets[op.c2_po].name
-//                     << "\n";
-//             // debug end    
-//             break;
-//         }
-//     }
-
-//     res.success = !res.poPairs.empty();
-//     // debug
-//     std::cerr << "[DBG][SolveBaseline] matched pairs = "
-//           << res.poPairs.size() << "\n";
-//     // debug end
-//     return res;
-// }
-MatchResult solveByPOSignatureBaseline(
-    const Circuit& c1, const BusInfo& b1,
-    const Circuit& c2, const BusInfo& b2,
-    int batches, int K, int threshold)
-{
-    (void)K; (void)threshold; // 這版不靠候選剪枝，先讓流程穩
-
-    MatchResult res;
-
-    // 0) topo + signatures (只做一次，不要在 cost loop 裡重算)
-    auto topo1 = topoSortGates(c1);
-    auto topo2 = topoSortGates(c2);
-    POSig sig1 = buildPOSignature(c1, topo1, batches, 12345);
-    POSig sig2 = buildPOSignature(c2, topo2, batches, 98765);
-
-    // PO net id -> PO index (for sig.ones indexing)
-    unordered_map<int,int> poIdx1, poIdx2;
-    for (int i = 0; i < (int)c1.POs.size(); i++) poIdx1[c1.POs[i]] = i;
-    for (int i = 0; i < (int)c2.POs.size(); i++) poIdx2[c2.POs[i]] = i;
-
-    // ---- precompute full PO cost matrix (score + inv) ----
-    int N1 = (int)c1.POs.size();
-    int N2 = (int)c2.POs.size();
-
-    std::vector<std::vector<int>> score(N1, std::vector<int>(N2, 0));
-    std::vector<std::vector<char>> invMat(N1, std::vector<char>(N2, 0));
-
-    for (int i = 0; i < N1; i++) {
-        for (int j = 0; j < N2; j++) {
-            int dSame, dInv;
-            distancePO_pvec(sig1.ones[i], sig2.ones[j], dSame, dInv);
-            score[i][j] = std::min(dSame, dInv);
-            invMat[i][j] = (dInv < dSame) ? 1 : 0;
-        }
-    }
-
-
-    auto poCost = [&](int poNet1, int poNet2, bool &inv) -> int {
-        auto it1 = poIdx1.find(poNet1);
-        auto it2 = poIdx2.find(poNet2);
-        if (it1 == poIdx1.end() || it2 == poIdx2.end()) {
-            inv = false;
-            return 1000000000;
-        }
-        int i = it1->second;
-        int j = it2->second;
-        inv = (invMat[i][j] != 0);
-        return score[i][j];
-    };
-
-    // --- precompute PI bus ids + net->PIbusId for bus-aware Step4 ---
-    auto piBusIds1_all = getPIBusIds(c1, b1);
-    auto piBusIds2_all = getPIBusIds(c2, b2);
-
-    std::vector<int> piBusIds1, piBusIds2;
-    for (int bid : piBusIds1_all)
-        if ((int)b1.buses[bid].members.size() >= 2) piBusIds1.push_back(bid);
-    for (int bid : piBusIds2_all)
-        if ((int)b2.buses[bid].members.size() >= 2) piBusIds2.push_back(bid);
-
-    std::vector<int> net2piBus1 = buildNetToPIBusId(c1, b1, piBusIds1);
-    std::vector<int> net2piBus2 = buildNetToPIBusId(c2, b2, piBusIds2);
-
-
-    // 1) 建立 PO bus-only groups（size>=2），singleton 不要進 bus-level Hungarian
-    std::vector<std::vector<int>> bus1, bus2;
-
-    std::vector<char> covered1((int)c1.nets.size(), 0);
-    std::vector<char> covered2((int)c2.nets.size(), 0);
-
-    // 取出「全是 PO」的 bus id
-    std::vector<int> outBus1 = filterBusIdsByType(c1, b1, /*wantPIbus=*/false, /*wantPObus=*/true);
-    std::vector<int> outBus2 = filterBusIdsByType(c2, b2, /*wantPIbus=*/false, /*wantPObus=*/true);
-
-    // 收集真正 bus (size>=2) 並標記 covered
-    for (int bid : outBus1) {
-        const auto& mem = b1.buses[bid].members;  // 這條 bus 的成員 net ids
-        if ((int)mem.size() >= 2) {
-            bus1.push_back(mem);
-            for (int nid : mem) if (nid >= 0 && nid < (int)covered1.size()) covered1[nid] = 1;
-        }
-    }
-    for (int bid : outBus2) {
-        const auto& mem = b2.buses[bid].members;
-        if ((int)mem.size() >= 2) {
-            bus2.push_back(mem);
-            for (int nid : mem) if (nid >= 0 && nid < (int)covered2.size()) covered2[nid] = 1;
-        }
-    }
-
-
-    // 這些是「非 bus」的 PO（或 bus 抽不到的 PO），之後會走 leftover（可以自由配到任何 c2 port）
-    std::vector<int> single1, single2;
-    single1.reserve(c1.POs.size());
-    single2.reserve(c2.POs.size());
-    for (int po : c1.POs) if (po >= 0 && po < (int)covered1.size() && !covered1[po]) single1.push_back(po);
-    for (int po : c2.POs) if (po >= 0 && po < (int)covered2.size() && !covered2[po]) single2.push_back(po);
-
-    // 用 bus-only 取代原本的 g1/g2
-    const auto& g1 = bus1;
-    const auto& g2 = bus2;
-
-    int G1 = (int)g1.size();
-    int G2 = (int)g2.size();
-
-    // 如果沒有真正的 bus，就不要做 bus-level Hungarian；直接讓全部都去 leftover（你原本的 greedy 會看所有 po2 候選）
-    if (G1 == 0 || G2 == 0) {
-        std::vector<char> used2((int)c2.POs.size(), 0);
-
-        // 這裡你可以選擇先處理「bus cover 的那些 PO」或先處理 singleton；
-    //  但因為 greedy 會掃所有剩下 po2，所以順序不影響正確性，只影響結果品質。
-    //  我先維持最簡單：照 c1.POs 順序全做一遍。
-        for (int i = 0; i < (int)c1.POs.size(); i++) {
-            int po1 = c1.POs[i];
-            int bestScore = 1000000000, bestJ = -1;
-            bool bestInv = false;
-
-            for (int j = 0; j < (int)c2.POs.size(); j++) if (!used2[j]) {
-                bool inv;
-                int s = poCost(po1, c2.POs[j], inv);
-                if (s < bestScore) { bestScore = s; bestJ = j; bestInv = inv; }
-            }
-            if (bestJ >= 0) {
-                MatchResult::OutPair op;
-                op.c1_po = po1;
-                op.c2_po = c2.POs[bestJ];
-                op.c1Neg = false;
-                op.c2Neg = bestInv;
-                res.poPairs.push_back(op);
-                used2[bestJ] = 1;
-            }
-        }
-        res.success = !res.poPairs.empty();
-        return res;
-    }
-
-
-    // 2) bus-level cost + Hungarian
-    const double WIDTH_PENALTY = 1000.0;
-    vector<vector<double>> costG(G1, vector<double>(G2, 0.0));
-
-    for (int i = 0; i < G1; i++) {
-        for (int j = 0; j < G2; j++) {
-            int w1 = (int)g1[i].size();
-            int w2 = (int)g2[j].size();
-            double base = std::abs(w1 - w2) * WIDTH_PENALTY;
-
-            // rough estimate: group 內最佳 pair 的 cost（越小越像）
-            int best = 1e9;
-            for (int a : g1[i]) for (int b : g2[j]) {
-                bool invDummy;
-                int s = poCost(a, b, invDummy);
-                if (s < best) best = s;
-            }
-            costG[i][j] = base + (double)best;
-        }
-    }
-
-    vector<int> gAssign = hungarianMinCost(costG);
-
-    // 3) bus 內 Hungarian
-    // used2: 用「PO index」標記是否已被配走
-    vector<char> used2((int)c2.POs.size(), 0);
-
-    // 也記一下 c1 哪些 PO 已經配過，避免 leftover 重複
-    unordered_map<int,char> used1Net;
-
-    for (int i = 0; i < G1; i++) {
-        int j = gAssign[i];
-        if (j < 0 || j >= G2) continue;
-
-        const auto& A = g1[i]; // PO net ids (c1 side)
-        const auto& B = g2[j]; // PO net ids (c2 side)
-
-        int n = (int)A.size();
-        int m = (int)B.size();
-        if (n == 0 || m == 0) continue;
-
-        vector<vector<double>> cost(n, vector<double>(m, 0.0));
-        vector<vector<char>> invFlag(n, vector<char>(m, 0));
-
-        for (int x = 0; x < n; x++) {
-            for (int y = 0; y < m; y++) {
-                bool inv;
-                int s = poCost(A[x], B[y], inv);
-                cost[x][y] = (double)s;
-                invFlag[x][y] = inv ? 1 : 0;
-            }
-        }
-
-        vector<int> assign = hungarianMinCost(cost); // rows(A)->col(B)
-        for (int x = 0; x < n; x++) {
-            int y = assign[x];
-            if (y < 0 || y >= m) continue;
-
-            // B[y] 是 PO net id；要轉成 PO index 才能 used2
-            auto it2 = poIdx2.find(B[y]);
-            if (it2 == poIdx2.end()) continue;
-            int po2Index = it2->second;
-            if (used2[po2Index]) continue; // 避免重複（理論上 Hungarian 不會，但保險）
-
-            MatchResult::OutPair op;
-            op.c1_po = A[x];
-            op.c2_po = B[y];
-            op.c1Neg = false;
-            op.c2Neg = (invFlag[x][y] != 0);
-
-            res.poPairs.push_back(op);
-            used2[po2Index] = 1;
-            used1Net[A[x]] = 1;
-        }
-    }
-
-    // 4) leftover fallback（先用 greedy；你若要全域 Hungarian 我也能再改）
-    for (int i = 0; i < (int)c1.POs.size(); i++) {
-        int po1 = c1.POs[i];
-        if (used1Net.find(po1) != used1Net.end()) continue;
-
-        int bestScore = 1e9;
-        int bestJ = -1;
-        bool bestInv = false;
-
-        for (int j = 0; j < (int)c2.POs.size(); j++) {
-            if (used2[j]) continue;
-            bool inv;
-            int s = poCost(po1, c2.POs[j], inv);
-            if (s < bestScore) {
-                bestScore = s;
-                bestJ = j;
-                bestInv = inv;
-            }
-        }
-
-        if (bestJ >= 0) {
-            MatchResult::OutPair op;
-            op.c1_po = po1;
-            op.c2_po = c2.POs[bestJ];
-            op.c1Neg = false;
-            op.c2Neg = bestInv;
-            res.poPairs.push_back(op);
-            used2[bestJ] = 1;
-        }
-    }
-    // Step4: build local hypothesis for each selected PO pair (for debug / for next step)
-    // std::vector<LocalHypothesis> hyps;
-    // hyps.reserve(res.poPairs.size());
-
-    cerr << "\n========== DEBUG: Step4+5a (build hyps then quick-verify) ==========\n";
-
-    int pairLimit   = 10;   // debug 印前幾個
-    int hypLimit    = 6;
-    int simBatches  = 8;
-
-    std::unordered_map<int, LocalHypothesis> chosenHypByPo1; // po1 -> chosen hypothesis
-    chosenHypByPo1.reserve(pairLimit * 2);
-
-    int cnt = 0;
-    for (const auto& pp : res.poPairs) {
-        if (cnt++ >= pairLimit) break;
-
-        auto hyps = buildLocalPIMappingHypothesesMulti(
-            c1, b1, c2, b2,
-            pp.c1_po, pp.c2_po,
-            piBusIds1, piBusIds2,
-            net2piBus1, net2piBus2,
-            hypLimit
-        );
-
-        cerr << "[POpair] " << c1.nets[pp.c1_po].name
-            << " <-> " << (pp.c2Neg ? "-" : "+") << c2.nets[pp.c2_po].name
-            << " | #hyps=" << hyps.size() << "\n";
-
-        bool anyPass = false;
-
-        for (int h = 0; h < (int)hyps.size(); h++) {
-            // (可選) 先印 hypothesis 前幾條 mapping
-            if (h == 0) {
-                int shown = 0;
-                for (auto& kv : hyps[h].map2to1) {
-                    if (shown++ >= 10) break;
-                    int pi2 = kv.first, pi1 = kv.second;
-                    cerr << "    2 " << c2.nets[pi2].name << " -> "
-                        << (pi1 == -2 ? "CONST0" : (pi1 == -3 ? "CONST1" : c1.nets[pi1].name))
-                        << "\n";
+        };
+
+        for (int it = 0; it < maxCegisIters; it++) {
+            bool madeAttempt = false;
+
+            int KpoStart = std::min(8, nPO);
+            int KpoMax = nPO;
+
+            for (int Kpo = KpoStart; ; ) {
+                for (int t = 0; t < poTries; t++) {
+                    for (int po2 = 0; po2 < nPO; po2++) {
+                        int k = std::min(Kpo, (int)poOrd[po2].size());
+                        if (k > 2) std::shuffle(poOrd[po2].begin(), poOrd[po2].begin() + k, rng);
+                    }
+
+                    curIt = it;
+                    curKpo = Kpo;
+                    if (tryOneGuess(Kpo)) {
+                        std::cerr << "[UnateBus] success=true  PI=" << nPI << "/" << nPI
+                                  << "  PO=" << nPO << "/" << nPO
+                                  << " combo=" << comboIdx << " it=" << it << "\n";
+                        return best;
+                    }
+
+                    madeAttempt = true;
                 }
+                if (Kpo >= KpoMax) break;
+                Kpo = std::min(KpoMax, Kpo * 2);
+
             }
 
-            bool ok = quickVerifyHypothesisBySim64(
-                c1, topo1, c2, topo2,
-                pp.c1_po, pp.c2_po, pp.c2Neg,
-                hyps[h],
-                simBatches,
-                1234567ULL + 99991ULL * (uint64_t)h
-            );
-
-            cerr << "  [Step5a] H" << h << " => " << (ok ? "PASS" : "FAIL") << "\n";
-
-            if (ok) {
-                anyPass = true;
-                chosenHypByPo1[pp.c1_po] = hyps[h]; // ✅ 把通過的存起來，給 Step5b 用
-                break;
-            }
-        }
-
-        if (!anyPass) {
-            cerr << "  => ALL hyps failed (likely wrong PO pair or Step4 too weak)\n";
+            if (!madeAttempt) break;
         }
     }
 
-    cerr << "============================================================\n";
+    std::cerr << "[UnateBus] success=false  PI=" << nPI << "/" << nPI
+              << "  PO=" << nPO << "/" << nPO << "\n";
 
-    res.success = !res.poPairs.empty();
-    // cerr << "\n========== DEBUG: res.poPairs (with ones distance) ==========\n";
+    if (!lastTried.piPairs.empty() && !lastTried.poPairs.empty()) {
+        best = lastTried;
+        best.success = false;
+        best.msg = "Failed after bus-aware CEGIS. witnesses=" + std::to_string(witnesses.size()) +
+                   " lastBadPo=(" + lastSat.badPoC1 + "," + lastSat.badPoC2 + ")";
+    } else {
+        best.msg = "Failed: could not build any valid PO/PI mapping under current bus+unate constraints.";
+    }
 
-    // for (const auto& pp : res.poPairs) {
-    //     int net1 = pp.c1_po;      // net id in c1
-    //     int net2 = pp.c2_po;      // net id in c2 (no sign here, you store sign separately)
-    //     bool invChosen = pp.c2Neg;
-
-    //     // 防呆
-    //     if (net1 < 0 || net1 >= (int)c1.nets.size()) continue;
-    //     if (net2 < 0 || net2 >= (int)c2.nets.size()) continue;
-
-    //     // 轉成 PO index（給 sig.ones 用）
-    //     auto it1 = poIdx1.find(net1);
-    //     auto it2 = poIdx2.find(net2);
-    //     if (it1 == poIdx1.end() || it2 == poIdx2.end()) continue;
-
-    //     int i = it1->second;
-    //     int j = it2->second;
-
-    //     int dSame, dInv;
-    //     distancePO_pvec(sig1.ones[i], sig2.ones[j], dSame, dInv);
-
-    //     cerr << "C1_PO " << c1.nets[net1].name
-    //         << " <-> C2_PO "
-    //         << (invChosen ? "-" : "+")
-    //         << c2.nets[net2].name
-    //         << " | dSame=" << dSame
-    //         << " dInv=" << dInv
-    //         << " | chosen=" << (invChosen ? "INV" : "SAME")
-    //         << "\n";
-    // }
-
-    // cerr << "============================================================\n\n";
-
-
-    return res;
+    return best;
 }

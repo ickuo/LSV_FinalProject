@@ -22,6 +22,7 @@ SRCS_CPP := \
     $(SRCDIR)/match_writer.cpp \
     $(SRCDIR)/sat_wrap.cpp \
     $(SRCDIR)/sat_check.cpp \
+    $(SRCDIR)/unate_table.cpp \
     $(SRCDIR)/main.cpp
 
 # Minisat sources (.cc)

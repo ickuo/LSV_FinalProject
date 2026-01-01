@@ -1,36 +1,52 @@
 #pragma once
-#include "parser.h"
-#include <utility>
-#include <vector>
+
 #include <string>
+#include <vector>
 
+// Forward declarations to keep headers light.
+struct Circuit;
+struct BusInfo;
 
-
-struct MatchResult {
-    std::vector<std::pair<int,int>> piPairs; // (c1_pi, c2_pi)
-    
-    struct OutPair {
-        int c1_po = -1;
-        int c2_po = -1;
-        bool c1Neg = false; // 先保留，但 writer 目前固定輸出 '+'
-        bool c2Neg = false; // true => OUTGROUP 會輸出 '-'
-    };
-    std::vector<OutPair> poPairs; // (c1_po, c2_po)
-    bool success = false;
+// Output port match (PO): allow optional inversion on circuit2 side.
+struct OutPortMatch {
+    int c1_po = -1;
+    int c2_po = -1;
+    bool c2Neg = false;
 };
 
-MatchResult solveByBusTT(
-    const Circuit& c1, const BusInfo& b1,
-    const Circuit& c2, const BusInfo& b2,
-    int maxPI = 16 // TT 上限
-);
+// Input port match (PI): allow optional inversion on circuit2 side.
+struct InPortMatch {
+    int c1_pi = -1;
+    int c2_pi = -1;
+    bool c2Neg = false;
+};
 
-// Baseline PO-signature-based solver (random simulation)
-MatchResult solveByPOSignatureBaseline(
-    const Circuit& c1, const BusInfo& b1,
-    const Circuit& c2, const BusInfo& b2,
-    int batches,
-    int K,
-    int threshold
-);
+struct MatchResult {
+    bool success = false;
+    std::string msg;
 
+    // For convenience in writer/SAT:
+    // - c1_* and c2_* are netIds.
+    // - Each PI/PO appears at most once.
+    std::vector<InPortMatch>  piPairs;
+    std::vector<OutPortMatch> poPairs;
+
+    // (Optional) constant groups are not handled yet in this solver.
+};
+
+// Unate + bus-aware multi-sample solver.
+// Notes:
+//  - Uses bus information as a hard constraint: a bus must map to a bus of the same width.
+//  - Within each mapped bus, does bit-level matching.
+//  - If a port is not in any bus, it can only map to another non-bus port.
+MatchResult solveByUnateCEGIS(const Circuit& c1,
+                             const Circuit& c2,
+                             const BusInfo& b1,
+                             const BusInfo& b2,
+                             const std::string& unateCsv1,
+                             const std::string& unateCsv2,
+                             int busSamples = 60,
+                             int maxCegisIters = 60,
+                             int poTries = 600,
+                             int piTriesPerPO = 80,
+                             int seed = 0);

@@ -1,63 +1,82 @@
-#include "parser.h"
 #include "match.h"
 #include "match_writer.h"
+#include "parser.h"
+
+#include <filesystem>
 #include <iostream>
 #include <string>
 
-int main(int argc, char** argv) {
-    std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
+namespace fs = std::filesystem;
 
+static std::string resolveRelativeTo(const std::string& baseFile, const std::string& maybeRel) {
+    fs::path p(maybeRel);
+    if (p.is_absolute()) return p.string();
+    fs::path baseDir = fs::path(baseFile).parent_path();
+    if (baseDir.empty()) return p.string();
+    fs::path cand = baseDir / p;
+    if (fs::exists(cand)) return cand.string();
+    return p.string();
+}
+
+static std::string pickUnateCsv(const std::string& inputFile, const std::string& fileName) {
+    fs::path baseDir = fs::path(inputFile).parent_path();
+    if (!baseDir.empty()) {
+        fs::path cand = baseDir / fileName;
+        if (fs::exists(cand)) return cand.string();
+    }
+    if (fs::exists(fileName)) return fileName;
+    // Best guess: next to input file.
+    return (baseDir / fileName).string();
+}
+
+int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_file> <match_file>\n";
+        std::cerr << "Usage: " << argv[0] << " <input_file> <output_match>\n";
         return 1;
     }
 
+    const std::string inputFile = argv[1];
+    const std::string outMatchFile = argv[2];
+
     try {
-        ProblemInput pin = parseProblemInputFile(argv[1]);
-        auto simpName = [](const std::string& path) {
-            // 假設 input 是 .../circuit_1.v
-            if (path.size() >= 2 && path.substr(path.size() - 2) == ".v") {
-                return path.substr(0, path.size() - 2) + "_simp.v";
-            }
-            return path; // fallback
-        };
+        ProblemInput in = parseProblemInputFile(inputFile);
 
-        Circuit c1 = parseVerilogNetlist(simpName(pin.c1File));
-        Circuit c2 = parseVerilogNetlist(simpName(pin.c2File));
+        const std::string c1Path = resolveRelativeTo(inputFile, in.c1File);
+        const std::string c2Path = resolveRelativeTo(inputFile, in.c2File);
 
-        BusInfo b1 = attachBuses(c1, pin.c1Buses);
-        BusInfo b2 = attachBuses(c2, pin.c2Buses);
+        Circuit c1 = parseVerilogNetlist(c1Path);
+        Circuit c2 = parseVerilogNetlist(c2Path);
 
-        MatchResult res = solveByBusTT(c1, b1, c2, b2, 16);
-        if (!res.success) {
-            // PI 太多或 bus TT 跑不動，就改用 signature baseline
-            std::cerr << "[DBG][Main] Using PO-signature solver\n";
-            res = solveByPOSignatureBaseline(c1, b1, c2, b2,
-                                     /*batches=*/16,
-                                     /*K=*/10,
-                                     /*threshold=*/120);
-        }
+        // Attach bus information (hard constraint: bus-to-bus only).
+        BusInfo b1 = attachBuses(c1, in.c1Buses);
+        BusInfo b2 = attachBuses(c2, in.c2Buses);
 
-        std::string inputPath  = argv[1];   // e.g. case01/input
-        std::string outputName = argv[2];   // e.g. output
+        const std::string unate1 = pickUnateCsv(inputFile, "unate_c1.csv");
+        const std::string unate2 = pickUnateCsv(inputFile, "unate_c2.csv");
 
-        std::string outPath;
-        size_t pos = inputPath.find_last_of("/\\");
-        if (pos == std::string::npos) {
-            // input 在目前目錄
-            outPath = outputName;
-        } else {
-            // output 放在 input 所在資料夾
-            outPath = inputPath.substr(0, pos + 1) + outputName;
-        }
+        // Defaults are tuned for case03-like (B-heavy) situations:
+        // - We do randomized guessing guided by unate signatures.
+        // - SAT provides witnesses to prune future guesses.
+        MatchResult res = solveByUnateCEGIS(
+            c1, c2,
+            b1, b2,
+            unate1, unate2,
+            /*busSamples*/ 60,
+            /*maxCegisIters*/ 120,
+            /*poTries*/ 2000,
+            /*piTriesPerPO*/ 250,
+            /*seed*/ 0
+        );
 
-        writeMatchFile(outPath, c1, c2, res);
+        std::cerr << "[UnateCEGIS] success=" << (res.success ? "true" : "false")
+                  << "  PI=" << res.piPairs.size() << "/" << c1.PIs.size()
+                  << "  PO=" << res.poPairs.size() << "/" << c1.POs.size() << "\n";
+        std::cerr << "[UnateCEGIS] msg: " << res.msg << "\n";
 
-        return 0;
-
+        writeMatchFile(outMatchFile, c1, c2, res);
+        return res.success ? 0 : 2;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
-        return 2;
+        return 1;
     }
 }

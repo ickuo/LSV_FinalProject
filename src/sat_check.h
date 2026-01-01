@@ -1,23 +1,25 @@
 #pragma once
+
 #include "parser.h"
+#include "match.h"
+
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <utility>
 
-// forward declare (MatchResult 定義在 match.h)
-struct MatchResult;
-
-// SAT check result
-// matched=true  => UNSAT, no counterexample exists (mapping is correct)
-// matched=false => SAT, witness is one PI assignment that breaks equivalence
 struct SatCheckResult {
-    bool matched = false;
-    std::vector<std::pair<std::string,int>> c1PiWitness; // only valid if matched==false
-    std::string badPoC1; // optional
-    std::string badPoC2; // optional
+    bool success = false;
+    std::string msg;
+
+    // If failed, we return a witness assignment for PIs of circuit1.
+    // Map from PI net name -> 0/1
+    std::unordered_map<std::string,int> c1PiWitness;
+
+    // Provide one bad PO pair names (debug)
+    std::string badPoC1;
+    std::string badPoC2;
 };
 
-// Build CNF miter from (c1,c2,guess) and run SAT.
-// If UNSAT => matched=true.
-// If SAT   => matched=false + returns one witness assignment on c1 PIs.
-SatCheckResult checkMatchBySAT(const Circuit& c1, const Circuit& c2, const MatchResult& guess);
+SatCheckResult checkMatchBySAT(const Circuit& c1,
+                               const Circuit& c2,
+                               const MatchResult& match);
