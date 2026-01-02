@@ -176,268 +176,6 @@ static bool hopcroftKarp(const vector<vector<int>>& adj, int nR, vector<int>& ma
 // ------------------------
 // Bus grouping & signatures (I,B,U)
 // ------------------------
-
-// ------------------------
-// Influence signature (simulation-based, inversion-invariant)
-// ------------------------
-// Motivation: when unate tables are dominated by 'B' (binate), unate-based row/col signatures
-// become nearly identical and provide little guidance. We add a simulation-based "influence spectrum"
-// that is:
-//   * invariant to PO inversion (uses pBal=min(p,1-p) and |P(y=1|x=1)-P(y=1|x=0)|),
-//   * invariant to PI permutation (sort the per-PI influences),
-//   * cheap to compute via 64-bit packed random simulation.
-//
-// For each PO y and each PI x, estimate influence:
-//   d(x->y) = | P(y=1 | x=1) - P(y=1 | x=0) |  in [0,1].
-// Then PO signature is the top-K sorted d-values (over all PIs) + pBal(y).
-// PI signature can be derived similarly (top-K over all POs), but currently we mainly use PO signature
-// to rank PO candidates.
-static constexpr int kInfTopK = 12;
-
-// Additional PO signature: output-output correlation profile.
-// For each PO y, compute corrAbs(y, z) = |P(y==z) - 0.5| under random inputs
-// and take the top-K values over all other outputs.
-// This is invariant under PI permutation / PI inversion and also invariant
-// under independent PO inversion (since P(y==~z)=1-P(y==z)).
-static constexpr int kCorrTopK = 12;
-
-struct InfluenceSig {
-    float pBal = 0.0f; // min(P(y=1), P(y=0)) in [0,0.5]
-    std::array<float, kInfTopK> top{}; // sorted desc, padded with 0
-};
-
-struct CorrSig {
-    std::array<float, kCorrTopK> top{}; // sorted desc, padded with 0
-};
-
-static inline int popc64(uint64_t x) { return __builtin_popcountll(x); }
-
-static inline double influenceDist(const InfluenceSig& a, const InfluenceSig& b) {
-    double d = 2.0 * std::abs((double)a.pBal - (double)b.pBal);
-    for (int i = 0; i < kInfTopK; ++i) d += std::abs((double)a.top[i] - (double)b.top[i]);
-    return d;
-}
-
-static inline int influenceDistScore(const InfluenceSig& a, const InfluenceSig& b) {
-    // Scale to an integer for stable ordering.
-    return (int)std::llround(influenceDist(a, b) * 10000.0);
-}
-
-static void pruneAllowedPiByInfluenceSig(const std::vector<InfluenceSig>& piInf1,
-                                        const std::vector<InfluenceSig>& piInf2,
-                                        std::vector<std::vector<int>>& allowedPi1,
-                                        int keepK,
-                                        std::mt19937& rng) {
-    if (keepK <= 0) return;
-    if (piInf1.empty() || piInf2.empty()) return;
-    const int nPI2 = (int)allowedPi1.size();
-    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
-        auto& cand = allowedPi1[pi2];
-        if ((int)cand.size() <= keepK) continue;
-
-        std::vector<std::pair<int,int>> scored;
-        scored.reserve(cand.size());
-        for (int pi1 : cand) {
-            if (pi1 < 0 || pi1 >= (int)piInf1.size() || pi2 >= (int)piInf2.size()) continue;
-            int d = influenceDistScore(piInf1[pi1], piInf2[pi2]);
-            scored.push_back({d, pi1});
-        }
-        if ((int)scored.size() <= keepK) {
-            cand.clear();
-            for (auto& p : scored) cand.push_back(p.second);
-            continue;
-        }
-
-        // Break ties randomly so we keep some diversity.
-        std::shuffle(scored.begin(), scored.end(), rng);
-
-        std::nth_element(scored.begin(), scored.begin() + keepK, scored.end(),
-                         [](const auto& a, const auto& b) { return a.first < b.first; });
-        scored.resize(keepK);
-
-        std::sort(scored.begin(), scored.end(),
-                  [](const auto& a, const auto& b) {
-                      if (a.first != b.first) return a.first < b.first;
-                      return a.second < b.second;
-                  });
-
-        cand.clear();
-        cand.reserve(keepK);
-        for (auto& p : scored) cand.push_back(p.second);
-    }
-}
-
-
-static void simulatePOsByBatchSharedMasks(const Circuit& c,
-                                         const std::vector<int>& topo,
-                                         const std::vector<std::vector<uint64_t>>& masksByBatch,
-                                         std::vector<std::vector<uint64_t>>& outByBatch) {
-    const int batches = (int)masksByBatch.size();
-    const int nPO = (int)c.POs.size();
-    outByBatch.assign(batches, std::vector<uint64_t>(nPO, 0));
-    for (int b = 0; b < batches; ++b) {
-        outByBatch[b] = simulateCircuit64(c, topo, masksByBatch[b], c.POs);
-    }
-}
-
-static inline double corrDist(const CorrSig& a, const CorrSig& b) {
-    double d = 0.0;
-    for (int i = 0; i < kCorrTopK; ++i) d += std::abs((double)a.top[i] - (double)b.top[i]);
-    return d;
-}
-
-static inline int corrDistScore(const CorrSig& a, const CorrSig& b) {
-    return (int)std::llround(corrDist(a, b) * 10000.0);
-}
-
-static void computePOBaselineOutputsSharedMasks(const Circuit& c,
-                                                const std::vector<int>& topo,
-                                                const std::vector<std::vector<uint64_t>>& masksByBatch,
-                                                std::vector<std::vector<uint64_t>>& outByBatch) {
-    const int nPI = (int)c.PIs.size();
-    const int nPO = (int)c.POs.size();
-    const int batches = (int)masksByBatch.size();
-    outByBatch.assign((size_t)batches, std::vector<uint64_t>((size_t)nPO, 0));
-    if (nPI == 0 || nPO == 0 || batches == 0) return;
-    for (int b = 0; b < batches; ++b) {
-        const auto& piMask = masksByBatch[b];
-        outByBatch[b] = simulateCircuit64(c, topo, piMask, c.POs);
-    }
-}
-
-static void computePOCorrSigsFromOutputs(const std::vector<std::vector<uint64_t>>& outByBatch,
-                                        std::vector<CorrSig>& corrOut) {
-    const int batches = (int)outByBatch.size();
-    const int nPO = batches ? (int)outByBatch[0].size() : 0;
-    const int totalBits = batches * 64;
-    corrOut.assign((size_t)nPO, CorrSig{});
-    if (batches == 0 || nPO == 0) return;
-
-    // Pre-pack outputs as [po][b] for cache-friendly pairwise popcounts.
-    std::vector<std::vector<uint64_t>> outPO((size_t)nPO, std::vector<uint64_t>((size_t)batches, 0));
-    for (int b = 0; b < batches; ++b) {
-        for (int po = 0; po < nPO; ++po) outPO[po][b] = outByBatch[b][po];
-    }
-
-    for (int po = 0; po < nPO; ++po) {
-        std::vector<float> vals;
-        vals.reserve((size_t)std::max(0, nPO - 1));
-        for (int other = 0; other < nPO; ++other) {
-            if (other == po) continue;
-            int ham = 0;
-            for (int b = 0; b < batches; ++b) {
-                ham += popc64(outPO[po][b] ^ outPO[other][b]);
-            }
-            int eq = totalBits - ham;
-            // corrAbs = |P(eq) - 0.5|
-            float corrAbs = std::abs((float)eq / (float)totalBits - 0.5f);
-            vals.push_back(corrAbs);
-        }
-        std::sort(vals.begin(), vals.end(), std::greater<float>());
-        for (int k = 0; k < kCorrTopK && k < (int)vals.size(); ++k) {
-            corrOut[po].top[k] = vals[k];
-        }
-    }
-}
-
-static void computeInfluenceSigsSharedMasks(const Circuit& c,
-                                            const std::vector<int>& topo,
-                                            const std::vector<std::vector<uint64_t>>& masksByBatch,
-                                            const std::vector<std::vector<uint64_t>>& outByBatch,
-                                            std::vector<InfluenceSig>& poSigOut,
-                                            std::vector<InfluenceSig>* piSigOut = nullptr) {
-    const int nPI = (int)c.PIs.size();
-    const int nPO = (int)c.POs.size();
-    const int batches = (int)masksByBatch.size();
-    const int totalBits = batches * 64;
-
-    poSigOut.assign(nPO, InfluenceSig{});
-    if (piSigOut) piSigOut->assign(nPI, InfluenceSig{});
-
-    if (nPI == 0 || nPO == 0 || batches == 0) return;
-
-    // cnt1[pi] = number of samples where x=1
-    std::vector<int> cnt1(nPI, 0);
-    for (int pi = 0; pi < nPI; ++pi) {
-        int s1 = 0;
-        for (int b = 0; b < batches; ++b) s1 += popc64(masksByBatch[b][pi]);
-        cnt1[pi] = s1;
-    }
-
-    // cntPO1[po] = number of samples where y=1
-    std::vector<int> cntPO1(nPO, 0);
-    for (int po = 0; po < nPO; ++po) {
-        int s1 = 0;
-        for (int b = 0; b < batches; ++b) s1 += popc64(outByBatch[b][po]);
-        cntPO1[po] = s1;
-    }
-
-    // onesXY[po][pi] = number of samples where (x=1,y=1)
-    std::vector<std::vector<int>> onesXY(nPO, std::vector<int>(nPI, 0));
-    for (int po = 0; po < nPO; ++po) {
-        for (int pi = 0; pi < nPI; ++pi) {
-            int s11 = 0;
-            for (int b = 0; b < batches; ++b) {
-                s11 += popc64(outByBatch[b][po] & masksByBatch[b][pi]);
-            }
-            onesXY[po][pi] = s11;
-        }
-    }
-
-    // If we also need PI signatures, cache influence matrix [po][pi].
-    std::vector<std::vector<float>> infMat;
-    if (piSigOut) infMat.assign(nPO, std::vector<float>(nPI, 0.0f));
-
-    // Build PO signatures: balance + top-K influences |P(y=1|x=1)-P(y=1|x=0)|
-    for (int po = 0; po < nPO; ++po) {
-        InfluenceSig sig;
-        double py = (double)cntPO1[po] / (double)totalBits;
-        sig.pBal = (float)std::min(py, 1.0 - py);
-
-        std::vector<float> infl;
-        infl.reserve(nPI);
-        for (int pi = 0; pi < nPI; ++pi) {
-            int c1 = cnt1[pi];
-            int c0 = totalBits - c1;
-            if (c1 == 0 || c0 == 0) { 
-                if (piSigOut) infMat[po][pi] = 0.0f;
-                infl.push_back(0.0f);
-                continue;
-            }
-            int a = onesXY[po][pi];               // x=1,y=1
-            int b = cntPO1[po] - a;               // x=0,y=1  (since y=1 total minus x=1,y=1)
-            double p1 = (double)a / (double)c1;
-            double p0 = (double)b / (double)c0;
-            float v = (float)std::abs(p1 - p0);
-            if (piSigOut) infMat[po][pi] = v;
-            infl.push_back(v);
-        }
-        std::sort(infl.begin(), infl.end(), std::greater<float>());
-        for (int i = 0; i < kInfTopK; ++i) sig.top[i] = (i < (int)infl.size()) ? infl[i] : 0.0f;
-
-        poSigOut[po] = sig;
-    }
-
-    // Build PI signatures: balance + top-K influences across POs (invariant to output inversion).
-    if (piSigOut) {
-        piSigOut->assign(nPI, InfluenceSig{});
-        for (int pi = 0; pi < nPI; ++pi) {
-            InfluenceSig sig;
-            double px = (double)cnt1[pi] / (double)totalBits;
-            sig.pBal = (float)std::min(px, 1.0 - px);
-
-            std::vector<float> infl;
-            infl.reserve(nPO);
-            for (int po = 0; po < nPO; ++po) infl.push_back(infMat[po][pi]);
-
-            std::sort(infl.begin(), infl.end(), std::greater<float>());
-            for (int i = 0; i < kInfTopK; ++i) sig.top[i] = (i < (int)infl.size()) ? infl[i] : 0.0f;
-
-            (*piSigOut)[pi] = sig;
-        }
-    }
-}
-
 struct PortBusGroup {
     int busId = -1;                 // index in BusInfo.buses
     std::vector<int> portIdx;        // indices into t.{piNetIds,poNetIds}
@@ -748,18 +486,12 @@ static bool buildAllowedByBus(const Circuit& c1,
 // ------------------------
 // PO candidate order (bus-aware restriction)
 // ------------------------
-
 static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
                                                  const UnateTable& t2,
                                                  const std::vector<std::vector<int>>& allowedPo1,
-                                                 const std::vector<InfluenceSig>& poInf1,
-                                                 const std::vector<InfluenceSig>& poInf2,
-                                                 const std::vector<CorrSig>& poCorr1,
-                                                 const std::vector<CorrSig>& poCorr2,
                                                  std::mt19937& rng) {
     vector<RowFeat> f1(t1.nPO), f2(t2.nPO);
 
-    // Reduced column keys for rowRefKey (still useful as a weak tie-break).
     auto ck1 = computeColReducedKeys(t1);
     auto ck2 = computeColReducedKeys(t2);
 
@@ -775,48 +507,45 @@ static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
     vector<vector<int>> ord(t2.nPO);
 
     for (int po2 = 0; po2 < t2.nPO; po2++) {
-        const vector<int>* allow = nullptr;
+        const std::vector<int>* allow = nullptr;
         if (!allowedPo1.empty()) allow = &allowedPo1[po2];
 
-        vector<std::pair<int,int>> scored;
-        if (allow) scored.reserve(allow->size());
-        else scored.reserve((size_t)t1.nPO);
-
-        auto addOne = [&](int po1) {
-            // Primary: simulation-based influence signature (robust under inversion and PI permutation).
-            int sc = 0;
-            if ((int)poInf1.size() == t1.nPO && (int)poInf2.size() == t2.nPO) {
-                sc += influenceDistScore(poInf1[po1], poInf2[po2]);
-            }
-
-            // Additional: PO correlation profile (robust even when unate is mostly binate).
-            if ((int)poCorr1.size() == t1.nPO && (int)poCorr2.size() == t2.nPO) {
-                sc += corrDistScore(poCorr1[po1], poCorr2[po2]);
-            }
-
-            // Secondary: unate row-feat distance (often weak when binate dominates).
-            sc += rowFeatDistL1(f1[po1], f2[po2]) * 200;
-
-            // Tertiary: reduced-key row reference (treat as a *bonus*, not a hard filter).
-            if (!f1[po1].refKey.empty() && f1[po1].refKey == f2[po2].refKey) {
-                sc -= 50000;
-            }
-            scored.emplace_back(sc, po1);
-        };
-
+        // Hard prune: if there exists any candidate with exactly the same refKey,
+        // only keep those refKey-matched candidates. This key is built on reduced
+        // relations (P/N -> U), so it is invariant to output inversion.
+        bool hasExactRef = false;
         if (allow) {
-            for (int po1 : *allow) addOne(po1);
+            for (int po1 : *allow) {
+                if (f1[po1].refKey == f2[po2].refKey) { hasExactRef = true; break; }
+            }
         } else {
-            for (int po1 = 0; po1 < t1.nPO; po1++) addOne(po1);
+            for (int po1 = 0; po1 < t1.nPO; po1++) {
+                if (f1[po1].refKey == f2[po2].refKey) { hasExactRef = true; break; }
+            }
         }
 
-        std::sort(scored.begin(), scored.end(),
-                  [](const auto& A, const auto& B) {
-                      if (A.first != B.first) return A.first < B.first;
-                      return A.second < B.second;
-                  });
+        vector<std::pair<int,int>> scored;
+        scored.reserve(allow ? allow->size() : (size_t)t1.nPO);
 
-        // Shuffle exact-score ties to avoid deterministic HK repetition.
+        if (allow) {
+            for (int po1 : *allow) {
+                if (hasExactRef && f1[po1].refKey != f2[po2].refKey) continue;
+                int sc = rowFeatDistL1(f1[po1], f2[po2]);
+                if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
+                scored.push_back({sc, po1});
+            }
+        } else {
+            for (int po1 = 0; po1 < t1.nPO; po1++) {
+                if (hasExactRef && f1[po1].refKey != f2[po2].refKey) continue;
+                int sc = rowFeatDistL1(f1[po1], f2[po2]);
+                if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
+                scored.push_back({sc, po1});
+            }
+        }
+
+        std::stable_sort(scored.begin(), scored.end(),
+                         [](const auto& a, const auto& b){ return a.first < b.first; });
+
         size_t i = 0;
         while (i < scored.size()) {
             size_t j = i + 1;
@@ -833,7 +562,6 @@ static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
     return ord;
 }
 
-
 // ------------------------
 // PI candidates from PO map (plus bus restriction)
 // ------------------------
@@ -847,19 +575,14 @@ static inline char swapPN(char r) {
 static inline bool relCompatible(char r1, char r2, bool rowFlip) {
     r1 = normRel(r1);
     r2 = normRel(r2);
-    if (!rowFlip) return r1 == r2;
-    // rowFlip means c2 PO is inverted => swap P/N on the c2-side relation.
-    r2 = swapPN(r2);
+    if (rowFlip) r2 = swapPN(r2);
     return r1 == r2;
 }
 
 static inline bool relCompatibleInv(char r1, char r2, bool rowFlip, bool piFlip) {
     r1 = normRel(r1);
     r2 = normRel(r2);
-    // rowFlip: c2 output inverted => swap P/N on c2 relation
-    if (rowFlip) r2 = swapPN(r2);
-    // piFlip: mapped PI is inverted => swap P/N on c2 relation
-    if (piFlip)  r2 = swapPN(r2);
+    if (rowFlip ^ piFlip) r2 = swapPN(r2);
     return r1 == r2;
 }
 
@@ -922,57 +645,49 @@ static bool buildPiCandidatesFromPoMap(const UnateTable& t1,
     return true;
 }
 
+
 static vector<char> chooseRowFlipHeuristic(const UnateTable& t1,
                                           const UnateTable& t2,
-                                          const vector<int>& poMap) {
+                                          const vector<int>& poMap,
+                                          const vector<uint8_t>& poBias1,
+                                          const vector<uint8_t>& poBias2) {
     vector<char> flip(t2.nPO, 0);
     for (int po2 = 0; po2 < t2.nPO; po2++) {
-        int po1 = poMap[po2];
+        const int po1 = poMap[po2];
         if (po1 < 0) continue;
 
-        int p1=0,n1=0,b1=0,i1=0;
-        int p2=0,n2=0,b2=0,i2=0;
-        for (int pi = 0; pi < t1.nPI; pi++) {
-            char a = normRel(t1.rel[po1][pi]);
-            if (a=='P') p1++; else if (a=='N') n1++; else if (a=='B') b1++; else i1++;
+        int p1 = 0, n1 = 0, b1 = 0, i1 = 0;
+        int p2 = 0, n2 = 0, b2 = 0, i2 = 0;
+
+        for (int pi1 = 0; pi1 < t1.nPI; pi1++) {
+            const char r = normRel(t1.rel[po1][pi1]);
+            if (r == 'P') p1++;
+            else if (r == 'N') n1++;
+            else if (r == 'B') b1++;
+            else i1++;
         }
-        for (int pi = 0; pi < t2.nPI; pi++) {
-            char a = normRel(t2.rel[po2][pi]);
-            if (a=='P') p2++; else if (a=='N') n2++; else if (a=='B') b2++; else i2++;
+        for (int pi2 = 0; pi2 < t2.nPI; pi2++) {
+            const char r = normRel(t2.rel[po2][pi2]);
+            if (r == 'P') p2++;
+            else if (r == 'N') n2++;
+            else if (r == 'B') b2++;
+            else i2++;
         }
 
-        int dNo = std::abs(p1 - p2) + std::abs(n1 - n2) + std::abs(b1 - b2) + std::abs(i1 - i2);
-        int dFl = std::abs(n1 - p2) + std::abs(p1 - n2) + std::abs(b1 - b2) + std::abs(i1 - i2);
-        flip[po2] = (dFl < dNo) ? 1 : 0;
-    }
-    return flip;
-}
+        const int dNo = abs(p1 - p2) + abs(n1 - n2) + abs(b1 - b2) + abs(i1 - i2);
+        const int dFl = abs(p1 - n2) + abs(n1 - p2) + abs(b1 - b2) + abs(i1 - i2);
 
-static vector<char> chooseRowFlipBySimOutputs(const std::vector<std::vector<uint64_t>>& outByBatch1,
-                                            const std::vector<std::vector<uint64_t>>& outByBatch2,
-                                            const vector<int>& poMap) {
-    // Decide per-PO inversion using simulation correlation:
-    // if y1 matches (~y2) better than y2, set flip=1.
-    const int batches = (int)outByBatch1.size();
-    const int nPO2 = (int)poMap.size();
-    vector<char> flip(nPO2, 0);
-    if (batches == 0) return flip;
-
-    for (int po2 = 0; po2 < nPO2; ++po2) {
-        int po1 = poMap[po2];
-        if (po1 < 0) continue;
-
-        int eq = 0;
-        int neq = 0;
-        for (int b = 0; b < batches; ++b) {
-            uint64_t y1 = outByBatch1[b][po1];
-            uint64_t y2 = outByBatch2[b][po2];
-            uint64_t x  = (y1 ^ y2);
-            int ne = popc64(x);
-            neq += ne;
-            eq  += (64 - ne);
+        int biasNo = 0, biasFl = 0;
+        if (!poBias1.empty() && !poBias2.empty()) {
+            const int bb1 = (int)poBias1[po1];
+            const int bb2 = (int)poBias2[po2];
+            biasNo = abs(bb1 - bb2);
+            biasFl = abs(bb1 - (255 - bb2));
         }
-        flip[po2] = (neq > eq) ? 1 : 0;
+
+        const int scoreNo = dNo * 16 + biasNo;
+        const int scoreFl = dFl * 16 + biasFl;
+        flip[po2] = (scoreFl < scoreNo) ? 1 : 0;
     }
     return flip;
 }
@@ -1015,15 +730,9 @@ static bool randomPerfectMatchPI(const vector<vector<int>>& cand,
 // After choosing a PI permutation (piMap), decide whether each c2 PI should be inverted.
 // piCandInvMask[pi2][k] is a bitmask for candidate pi1=piCand[pi2][k]:
 //   bit0: ok with no PI inversion, bit1: ok with PI inversion.
-// After choosing a PI permutation (piMap), decide whether each c2 PI should be inverted.
-// IMPORTANT: Many PI columns are ambiguous under reduced unate constraints; in that case
-// both inverted and non-inverted can be feasible. A greedy "prefer non-inverted" choice
-// can lock out the true solution and lead to satCalls=0 forever. We therefore RANDOMIZE
-// the choice when both are allowed.
 static bool derivePiFlipForMap(const vector<vector<int>>& piCand,
                                const vector<vector<uint8_t>>& piCandInvMask,
                                const vector<int>& piMap,
-                               std::mt19937& rng,
                                vector<char>& piFlip) {
     const int nPI = (int)piMap.size();
     piFlip.assign(nPI, 0);
@@ -1036,18 +745,9 @@ static bool derivePiFlipForMap(const vector<vector<int>>& piCand,
             if (cand[i] == pi1) { mask = msk[i]; break; }
         }
         if (mask == 0) return false;
-
-        // mask bit0: ok without inversion, bit1: ok with inversion
-        if ((mask & 1) && (mask & 2)) {
-            // ambiguous -> explore both
-            piFlip[pi2] = (char)(rng() & 1U);
-        } else if (mask & 1) {
-            piFlip[pi2] = 0;
-        } else if (mask & 2) {
-            piFlip[pi2] = 1;
-        } else {
-            return false;
-        }
+        if (mask & 1) piFlip[pi2] = 0;        // prefer non-inverted if possible
+        else if (mask & 2) piFlip[pi2] = 1;
+        else return false;
     }
     return true;
 }
@@ -1128,6 +828,34 @@ static inline uint64_t randU64(std::mt19937& rng) {
     uint64_t hi = (uint64_t)rng();
     uint64_t lo = (uint64_t)rng();
     return (hi << 32) | lo;
+}
+
+
+static vector<uint8_t> computePoBiasQuant(const Circuit& c,
+                                         const vector<int>& topo,
+                                         std::mt19937& rng,
+                                         int batches) {
+    const int nPI = (int)c.PIs.size();
+    const int nPO = (int)c.POs.size();
+    vector<uint64_t> ones(nPO, 0);
+
+    for (int b = 0; b < batches; b++) {
+        vector<uint64_t> piMask(nPI);
+        for (int i = 0; i < nPI; i++) piMask[i] = randU64(rng);
+        const vector<uint64_t> out = simulateCircuit64(c, topo, piMask, c.POs);
+        for (int po = 0; po < nPO; po++) ones[po] += (uint64_t)__builtin_popcountll(out[po]);
+    }
+
+    const double denom = 64.0 * (double)batches;
+    vector<uint8_t> q(nPO, 0);
+    for (int po = 0; po < nPO; po++) {
+        const double p1 = (denom > 0.0) ? ((double)ones[po] / denom) : 0.0;
+        int qi = (int)llround(p1 * 255.0);
+        if (qi < 0) qi = 0;
+        if (qi > 255) qi = 255;
+        q[po] = (uint8_t)qi;
+    }
+    return q;
 }
 
  
@@ -1271,23 +999,6 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
     // significantly increases robustness.
     if (busSamples < 60) busSamples = 60;
 
-// Speed guard: avoid burning millions of PI tries on a fixed (wrong) PO mapping.
-// This cap does not affect correctness (SAT is still the final authority), it only changes exploration order.
-if (piTriesPerPO > 20000) piTriesPerPO = 20000;
-
-static bool printedBanner = false;
-if (!printedBanner) {
-    printedBanner = true;
-    std::cerr << "[DBG][Match] UnateCEGIS"
-              << " busSamples=" << busSamples
-              << " poTries=" << poTries
-              << " piTriesPerPO=" << piTriesPerPO
-              << " maxIters=" << maxCegisIters
-              << " seed=" << seed
-              << "\n";
-}
-
-
     MatchResult best;
     best.success = false;
     best.msg = "No solution tried yet.";
@@ -1316,31 +1027,9 @@ if (!printedBanner) {
 
     std::mt19937 rng((seed == 0) ? std::random_device{}() : (unsigned)seed);
 
-    // ------------------------
-    // Influence signatures (simulation-based, inversion/perm invariant)
-    // ------------------------
-    // Use the same random PI masks for c1/c2 to reduce sampling noise.
-    const int sigBatches = 64; // 64*64 = 4096 random samples
-    std::mt19937 rngSig((seed == 0) ? 0xC0FFEEu : (unsigned)(seed ^ 0x9E3779B9u));
-
-    std::vector<std::vector<uint64_t>> sigMasks((size_t)sigBatches, std::vector<uint64_t>((size_t)nPI, 0));
-    for (int b = 0; b < sigBatches; ++b) {
-        for (int pi = 0; pi < nPI; ++pi) sigMasks[b][pi] = randU64(rngSig);
-    }
-
-    // Baseline PO outputs for correlation signature and for influence computation.
-    std::vector<std::vector<uint64_t>> outByBatch1, outByBatch2;
-    computePOBaselineOutputsSharedMasks(c1, topo1, sigMasks, outByBatch1);
-    computePOBaselineOutputsSharedMasks(c2, topo2, sigMasks, outByBatch2);
-
-    std::vector<InfluenceSig> poInf1, poInf2, piInf1, piInf2;
-    computeInfluenceSigsSharedMasks(c1, topo1, sigMasks, outByBatch1, poInf1, &piInf1);
-    computeInfluenceSigsSharedMasks(c2, topo2, sigMasks, outByBatch2, poInf2, &piInf2);
-
-    // Output-output correlation signature (top-K corrAbs values) per PO.
-    std::vector<CorrSig> poCorr1, poCorr2;
-    computePOCorrSigsFromOutputs(outByBatch1, poCorr1);
-    computePOCorrSigsFromOutputs(outByBatch2, poCorr2);
+std::mt19937 rngBias = rng;
+const vector<uint8_t> poBias1 = computePoBiasQuant(c1, topo1, rngBias, 16);
+const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
 
     // ------------------------
     // (1) Build bus groups & bus mapping samples (input buses and output buses separately)
@@ -1466,10 +1155,6 @@ if (!printedBanner) {
         int curIt = -1;
         int curKpo = -1;
 
-// If HK keeps returning the same PO matching, don't spend too long re-trying PI permutations for it.
-std::unordered_map<uint64_t, int> poMapRepeat;
-poMapRepeat.reserve(4096);
-
         // busId maps (size = b2.buses.size())
         std::vector<int> inBusIdMap2to1;
         if (!inB2.empty()) {
@@ -1506,21 +1191,8 @@ poMapRepeat.reserve(4096);
         }
         if (!piKeyOk) continue;
 
-        // Soft-prune PI candidates by inverter-invariant influence signature
-        // (helps when unate table is mostly binate and provides weak guidance).
-        {
-            const int kKeep = 24; // keep top-K candidates per PI2
-            pruneAllowedPiByInfluenceSig(piInf1, piInf2, allowedPi1, kKeep, rng);
-            bool ok = true;
-            for (int pi2 = 0; pi2 < nPI; ++pi2) {
-                if (allowedPi1[pi2].empty()) { ok = false; break; }
-            }
-            if (!ok) continue;
-        }
-
-
         // Build PO ordering (restricted by bus)
-        vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, poInf1, poInf2, poCorr1, poCorr2, rng);
+        vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, rng);
 
         auto tryOneGuess = [&](int Kpo) -> bool {
             vector<vector<int>> adjPO(nPO);
@@ -1532,18 +1204,7 @@ poMapRepeat.reserve(4096);
             vector<int> poMap;
             if (!hopcroftKarp(adjPO, nPO, poMap)) { hkFailPO++; return false; }
 
-// Skip overly repeated PO maps (usually caused by near-deterministic HK on similar candidate lists).
-// This forces the outer loop to reshuffle PO candidate prefixes and/or increase Kpo.
-{
-    uint64_t hpo = hashMatching(poMap);
-    int &cnt = poMapRepeat[hpo];
-    cnt++;
-    if (cnt > 12) {
-        return false;
-    }
-}
-
-            vector<char> rowFlip = chooseRowFlipBySimOutputs(outByBatch1, outByBatch2, poMap);
+            vector<char> rowFlip = chooseRowFlipHeuristic(t1, t2, poMap, poBias1, poBias2);
 
             vector<vector<int>> piCand;
             vector<vector<uint8_t>> piCandInvMask;
@@ -1554,17 +1215,12 @@ poMapRepeat.reserve(4096);
             vector<int> piMapHK;
             if (!hopcroftKarp(piCand, nPI, piMapHK)) { hkFailPI++; return false; }
 
-            // Dynamic stall window: if we keep rejecting without learning a new witness,
-            // stop burning PI tries on this fixed PO-map and move on.
-            size_t   stallWSize = witnesses.size();
-            uint64_t stallRej   = witnessReject + simReject;
-
             for (int attempt = 0; attempt < piTriesPerPO; attempt++) {
                 vector<int> piMap = piMapHK;
                 if (!randomPerfectMatchPI(piCand, rng, piMap)) { randPiFail++; continue; }
 
                 vector<char> piFlip;
-                if (!derivePiFlipForMap(piCand, piCandInvMask, piMap, rng, piFlip)) { randPiFail++; continue; }
+                if (!derivePiFlipForMap(piCand, piCandInvMask, piMap, piFlip)) { randPiFail++; continue; }
 
                 MatchResult guess = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip);
                 lastTried = guess;
@@ -1591,22 +1247,6 @@ poMapRepeat.reserve(4096);
                                   << " witnesses=" << witnesses.size()
                                   << " t=" << sec << "s\n";
                     }
-                }
-
-                // Stall guard: if we keep failing for a long time *without adding new witnesses*,
-                // we are likely stuck on a wrong PO-map (or wrong polarity choice). Move on.
-                if (witnesses.size() != stallWSize) {
-                    stallWSize = witnesses.size();
-                    stallRej = witnessReject + simReject;
-                } else if ((witnessReject + simReject - stallRej) >= 30000) {
-                    std::cerr << "[STALL] give-up PI tries (no new witness)"
-                              << " rej=" << (witnessReject + simReject - stallRej)
-                              << " w=" << witnesses.size()
-                              << " poRep=" << poMapRepeat[hashMatching(poMap)]
-                              << " Kpo=" << curKpo
-                              << " it=" << curIt
-                              << "\n";
-                    break;
                 }
 
                 if (!passesAllWitnessesBatched(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip, witnesses)) {
