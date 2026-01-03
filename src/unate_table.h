@@ -9,7 +9,8 @@
 //   P: positive unate
 //   N: negative unate
 //   B: binate
-// Missing/unknown entries are represented as 'I' (safe default).
+//   X: unknown/unspecified
+// Missing/unknown entries are represented as 'X' (wildcard/unspecified).
 struct UnateTable {
     int nPO = 0;
     int nPI = 0;

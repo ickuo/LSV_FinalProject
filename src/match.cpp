@@ -29,15 +29,16 @@ using std::vector;
 // Unate helpers
 // ------------------------
 static inline char normRel(char c) {
+    // Normalize to one of {P,N,B,I,X}; treat others as unknown ('X').
     switch (c) {
-        case 'P': case 'N': case 'B': case 'I': return c;
-        default: return 'I';
+        case 'P': case 'N': case 'B': case 'I': case 'X': return c;
+        default: return 'X';
     }
 }
 static inline char redRel(char c) {
     c = normRel(c);
     if (c == 'P' || c == 'N') return 'U';
-    return c; // B or I
+    return c; // B / I / X
 }
 
 // ------------------------
@@ -48,6 +49,8 @@ struct RowFeat {
     int maxPN = 0;
     int cntB  = 0;
     int cntI  = 0;
+    int cntX  = 0;
+    int nPI   = 0;
     std::string refKey;
 };
 
@@ -59,27 +62,36 @@ static RowFeat makeRowFeat(const UnateTable& t, int poIdx) {
         if (a == 'P') cntP++;
         else if (a == 'N') cntN++;
         else if (a == 'B') f.cntB++;
-        else f.cntI++;
+        else if (a == 'I') f.cntI++;
+        else f.cntX++;
     }
     f.minPN = std::min(cntP, cntN);
     f.maxPN = std::max(cntP, cntN);
+    f.nPI   = t.nPI;
     return f;
 }
 
 static inline int rowFeatDistL1(const RowFeat& a, const RowFeat& b) {
-    return std::abs(a.minPN - b.minPN) + std::abs(a.maxPN - b.maxPN) +
-           std::abs(a.cntB  - b.cntB)  + std::abs(a.cntI  - b.cntI);
+    // Use normalized counts so different PI-count circuits remain comparable.
+    auto norm = [](int x, int n) -> int { return n ? (int)((long long)x * 1000 / n) : x; };
+    return std::abs(norm(a.minPN, a.nPI) - norm(b.minPN, b.nPI)) +
+           std::abs(norm(a.maxPN, a.nPI) - norm(b.maxPN, b.nPI)) +
+           std::abs(norm(a.cntB,  a.nPI) - norm(b.cntB,  b.nPI)) +
+           std::abs(norm(a.cntI,  a.nPI) - norm(b.cntI,  b.nPI)) +
+           std::abs(norm(a.cntX,  a.nPI) - norm(b.cntX,  b.nPI));
 }
 
 static inline std::string colReducedKey(const UnateTable& t, int piIdx) {
-    int cntU = 0, cntB = 0, cntI = 0;
+    int cntU = 0, cntB = 0, cntI = 0, cntX = 0;
     for (int po = 0; po < t.nPO; po++) {
         char r = redRel(t.rel[po][piIdx]);
         if (r == 'U') cntU++;
         else if (r == 'B') cntB++;
-        else cntI++;
+        else if (r == 'I') cntI++;
+        else cntX++;
     }
-    return std::to_string(cntU) + "," + std::to_string(cntB) + "," + std::to_string(cntI);
+    return std::to_string(cntU) + "," + std::to_string(cntB) + "," +
+           std::to_string(cntI) + "," + std::to_string(cntX);
 }
 
 static inline std::vector<std::string> computeColReducedKeys(const UnateTable& t) {
@@ -92,15 +104,15 @@ static inline std::string makeRowRefKey(const UnateTable& t,
                                         int poIdx,
                                         const std::vector<std::string>& colKeys,
                                         const RowFeat& base) {
-    std::unordered_map<std::string, std::array<int,3>> hist;
+    std::unordered_map<std::string, std::array<int,4>> hist;
     hist.reserve((size_t)t.nPI * 2);
 
     for (int pi = 0; pi < t.nPI; pi++) {
         const std::string& ck = colKeys[pi];
         char r = redRel(t.rel[poIdx][pi]);
-        int idx = (r == 'U') ? 0 : (r == 'B' ? 1 : 2);
+        int idx = (r == 'U') ? 0 : (r == 'B' ? 1 : (r == 'I' ? 2 : 3));
         auto it = hist.find(ck);
-        if (it == hist.end()) it = hist.emplace(ck, std::array<int,3>{0,0,0}).first;
+        if (it == hist.end()) it = hist.emplace(ck, std::array<int,4>{0,0,0,0}).first;
         it->second[idx]++;
     }
 
@@ -110,10 +122,11 @@ static inline std::string makeRowRefKey(const UnateTable& t,
     std::sort(keys.begin(), keys.end());
 
     std::ostringstream oss;
-    oss << base.minPN << "/" << base.maxPN << "|" << base.cntB << "|" << base.cntI << "|";
+    oss << base.minPN << "/" << base.maxPN << "|" << base.cntB << "|" << base.cntI
+        << "|" << base.cntX << "|";
     for (const auto& k : keys) {
         const auto& a = hist[k];
-        oss << k << ":" << a[0] << "," << a[1] << "," << a[2] << ";";
+        oss << k << ":" << a[0] << "," << a[1] << "," << a[2] << "," << a[3] << ";";
     }
     return oss.str();
 }
@@ -174,12 +187,73 @@ static bool hopcroftKarp(const vector<vector<int>>& adj, int nR, vector<int>& ma
 }
 
 // ------------------------
+// Hopcroft-Karp (maximum matching)
+//   - returns #matched on L (<= min(|L|,|R|))
+//   - fills matchL (size=|L|, value in [0,nR) or -1)
+//   - optionally fills matchR (size=nR, value in [0,|L|) or -1)
+// ------------------------
+static int hopcroftKarpMax(const vector<vector<int>>& adj, int nR, vector<int>& matchL, vector<int>* outMatchR = nullptr) {
+    const int nL = (int)adj.size();
+    vector<int> matchR(nR, -1);
+    matchL.assign(nL, -1);
+
+    vector<int> dist(nL);
+    auto bfs = [&]() -> bool {
+        vector<int> q;
+        q.reserve(nL);
+        for (int u = 0; u < nL; u++) {
+            if (matchL[u] == -1) { dist[u] = 0; q.push_back(u); }
+            else dist[u] = -1;
+        }
+        bool foundAug = false;
+        for (size_t qi = 0; qi < q.size(); qi++) {
+            int u = q[qi];
+            for (int v : adj[u]) {
+                int u2 = matchR[v];
+                if (u2 >= 0 && dist[u2] == -1) {
+                    dist[u2] = dist[u] + 1;
+                    q.push_back(u2);
+                }
+                if (u2 == -1) foundAug = true;
+            }
+        }
+        return foundAug;
+    };
+
+    std::function<bool(int)> dfs = [&](int u) -> bool {
+        for (int v : adj[u]) {
+            int u2 = matchR[v];
+            if (u2 == -1 || (dist[u2] == dist[u] + 1 && dfs(u2))) {
+                matchL[u] = v;
+                matchR[v] = u;
+                return true;
+            }
+        }
+        dist[u] = -1;
+        return false;
+    };
+
+    int matching = 0;
+    while (bfs()) {
+        for (int u = 0; u < nL; u++) {
+            if (matchL[u] == -1) {
+                if (dfs(u)) matching++;
+            }
+        }
+    }
+
+    if (outMatchR) *outMatchR = std::move(matchR);
+    return matching;
+}
+
+// ------------------------
 // Bus grouping & signatures (I,B,U)
 // ------------------------
 struct PortBusGroup {
     int busId = -1;                 // index in BusInfo.buses
     std::vector<int> portIdx;        // indices into t.{piNetIds,poNetIds}
     std::vector<std::array<int,3>> triples; // sorted (I,B,U) per member
+    std::array<int,3> sum = {0,0,0};        // aggregated (I,B,U) across members
 };
 
 static std::array<int,3> colIBU(const UnateTable& t, int piIdx) {
@@ -204,12 +278,37 @@ static std::array<int,3> rowIBU(const UnateTable& t, int poIdx) {
     return {cntI, cntB, cntU};
 }
 
+static inline int l1Dist3(const std::array<int,3>& a, const std::array<int,3>& b) {
+    return std::abs(a[0]-b[0]) + std::abs(a[1]-b[1]) + std::abs(a[2]-b[2]);
+}
+
+static std::vector<std::array<int,3>> allColIBU(const UnateTable& t) {
+    std::vector<std::array<int,3>> v;
+    v.reserve(t.nPI);
+    for (int pi = 0; pi < t.nPI; ++pi) v.push_back(colIBU(t, pi));
+    return v;
+}
+
 static int busDistL1(const PortBusGroup& a, const PortBusGroup& b) {
     if (a.portIdx.size() != b.portIdx.size()) return 1e9;
     int d = 0;
     for (size_t i = 0; i < a.triples.size(); i++) {
         for (int k = 0; k < 3; k++) d += std::abs(a.triples[i][k] - b.triples[i][k]);
     }
+    return d;
+}
+
+// Flexible distance: allow b to have extra members (b.size >= a.size).
+// We compare the best-aligned sorted triples on the prefix and penalize extra bits.
+static int busDistL1Flex(const PortBusGroup& a, const PortBusGroup& b, int extraBitPenalty = 2000) {
+    if ((int)b.portIdx.size() < (int)a.portIdx.size()) return 1e9;
+    int d = 0;
+    const int n = (int)a.triples.size();
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) d += std::abs(a.triples[i][k] - b.triples[i][k]);
+    }
+    const int extra = (int)b.triples.size() - n;
+    if (extra > 0) d += extra * extraBitPenalty;
     return d;
 }
 
@@ -239,7 +338,11 @@ static void extractBusGroups(const Circuit& c,
         if (!g.portIdx.empty()) {
             g.triples.reserve(g.portIdx.size());
             for (int idx : g.portIdx) {
-                g.triples.push_back(isInput ? colIBU(t, idx) : rowIBU(t, idx));
+                std::array<int,3> tri = isInput ? colIBU(t, idx) : rowIBU(t, idx);
+                g.triples.push_back(tri);
+                g.sum[0] += tri[0];
+                g.sum[1] += tri[1];
+                g.sum[2] += tri[2];
             }
             std::sort(g.triples.begin(), g.triples.end());
             groups.push_back(std::move(g));
@@ -293,6 +396,83 @@ static bool buildBusAdj(const std::vector<PortBusGroup>& g1,
             while (keep < (int)scored.size() && scored[keep].first == bound) keep++;
         }
 
+        adj[i].reserve(keep);
+        for (int k = 0; k < keep; k++) adj[i].push_back(scored[k].second);
+        if (adj[i].empty()) return false;
+    }
+    return true;
+}
+
+// Build adjacency for input bus matching allowing Circuit-II buses to be wider.
+// Constraint: width(c2bus) must satisfy width(c1bus) <= width(c2bus) <= width(c1bus)+maxExtraBits.
+static bool buildBusAdjFlexInput(const std::vector<PortBusGroup>& g1,
+                                 const std::vector<PortBusGroup>& g2,
+                                 int topK,
+                                 int maxExtraBits,
+                                 std::vector<std::vector<int>>& adj) {
+    const int nL = (int)g2.size();
+    const int nR = (int)g1.size();
+    adj.assign(nL, {});
+
+    if (nL != nR) return false;
+
+    // Note: the (I,B,U) dominance is a *heuristic*.
+    // In real benchmarks, due to unate-table noise/unknowns, strict dominance can prune away
+    // the true bus mapping (e.g., case07). Therefore we treat dominance as a *soft penalty*.
+    const int domPenalty = 5; // per-count penalty when g2 sum is smaller than g1 sum
+
+    auto distFlexBoth = [](const PortBusGroup& a, const PortBusGroup& b) -> int {
+        // Symmetric version of busDistL1Flex: allow either side to be wider.
+        if (b.portIdx.size() >= a.portIdx.size()) return busDistL1Flex(a, b);
+        return busDistL1Flex(b, a);
+    };
+
+    for (int i = 0; i < nL; i++) {
+        std::vector<std::pair<int,int>> scored;
+        scored.reserve(nR);
+
+        auto pushCandidates = [&](int extraBits, bool directional) {
+            for (int j = 0; j < nR; j++) {
+                int w2 = (int)g2[i].portIdx.size();
+                int w1 = (int)g1[j].portIdx.size();
+
+                if (directional) {
+                    // Primary rule: allow Circuit-II bus to be wider (duplicates/const), but not narrower.
+                    if (w2 < w1) continue;
+                    if (w2 > w1 + extraBits) continue;
+                } else {
+                    // Fallback: allow either side to be wider if directional yields empty candidates.
+                    if (std::abs(w2 - w1) > extraBits) continue;
+                }
+
+                int d = directional ? busDistL1Flex(g1[j], g2[i]) : distFlexBoth(g1[j], g2[i]);
+
+                // Soft dominance penalty: prefer sum(g2) >= sum(g1)
+                if (g2[i].sum[0] < g1[j].sum[0]) d += (g1[j].sum[0] - g2[i].sum[0]) * domPenalty;
+                if (g2[i].sum[1] < g1[j].sum[1]) d += (g1[j].sum[1] - g2[i].sum[1]) * domPenalty;
+                if (g2[i].sum[2] < g1[j].sum[2]) d += (g1[j].sum[2] - g2[i].sum[2]) * domPenalty;
+
+                scored.push_back({d, j});
+            }
+        };
+
+        // First try the requested directional rule.
+        pushCandidates(maxExtraBits, true);
+        // If empty, relax width direction.
+        if (scored.empty()) pushCandidates(maxExtraBits, false);
+        // If still empty, last-resort widen slack a bit (prevents hard failure on edge cases).
+        if (scored.empty()) pushCandidates(maxExtraBits + 2, false);
+
+        if (scored.empty()) return false;
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        int keep = std::min(topK, (int)scored.size());
+        if (keep < (int)scored.size()) {
+            int bound = scored[keep - 1].first;
+            while (keep < (int)scored.size() && scored[keep].first == bound) keep++;
+        }
         adj[i].reserve(keep);
         for (int k = 0; k < keep; k++) adj[i].push_back(scored[k].second);
         if (adj[i].empty()) return false;
@@ -510,33 +690,17 @@ static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
         const std::vector<int>* allow = nullptr;
         if (!allowedPo1.empty()) allow = &allowedPo1[po2];
 
-        // Hard prune: if there exists any candidate with exactly the same refKey,
-        // only keep those refKey-matched candidates. This key is built on reduced
-        // relations (P/N -> U), so it is invariant to output inversion.
-        bool hasExactRef = false;
-        if (allow) {
-            for (int po1 : *allow) {
-                if (f1[po1].refKey == f2[po2].refKey) { hasExactRef = true; break; }
-            }
-        } else {
-            for (int po1 = 0; po1 < t1.nPO; po1++) {
-                if (f1[po1].refKey == f2[po2].refKey) { hasExactRef = true; break; }
-            }
-        }
-
         vector<std::pair<int,int>> scored;
         scored.reserve(allow ? allow->size() : (size_t)t1.nPO);
 
         if (allow) {
             for (int po1 : *allow) {
-                if (hasExactRef && f1[po1].refKey != f2[po2].refKey) continue;
                 int sc = rowFeatDistL1(f1[po1], f2[po2]);
                 if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
                 scored.push_back({sc, po1});
             }
         } else {
             for (int po1 = 0; po1 < t1.nPO; po1++) {
-                if (hasExactRef && f1[po1].refKey != f2[po2].refKey) continue;
                 int sc = rowFeatDistL1(f1[po1], f2[po2]);
                 if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
                 scored.push_back({sc, po1});
@@ -582,6 +746,8 @@ static inline bool relCompatible(char r1, char r2, bool rowFlip) {
 static inline bool relCompatibleInv(char r1, char r2, bool rowFlip, bool piFlip) {
     r1 = normRel(r1);
     r2 = normRel(r2);
+    // Unknown ('X') is treated as wildcard.
+    if (r1 == 'X' || r2 == 'X') return true;
     if (rowFlip ^ piFlip) r2 = swapPN(r2);
     return r1 == r2;
 }
@@ -594,19 +760,20 @@ static bool buildPiCandidatesFromPoMap(const UnateTable& t1,
                                        vector<vector<int>>& piCand,
                                        vector<vector<uint8_t>>& piCandInvMask) {
     const int nPO = t2.nPO;
-    const int nPI = t2.nPI;
+    const int nPI2 = t2.nPI;
+    const int nPI1 = t1.nPI;
 
-    piCand.assign(nPI, {});
-    piCandInvMask.assign(nPI, {});
-    for (int pi2 = 0; pi2 < nPI; pi2++) {
+    piCand.assign(nPI2, {});
+    piCandInvMask.assign(nPI2, {});
+    for (int pi2 = 0; pi2 < nPI2; pi2++) {
         const std::vector<int>* allow = nullptr;
         if (!allowedPi1.empty()) allow = &allowedPi1[pi2];
 
         vector<int> cand;
-        cand.reserve(allow ? allow->size() : (size_t)nPI);
+        cand.reserve(allow ? allow->size() : (size_t)nPI1);
 
         vector<uint8_t> invMask;
-        invMask.reserve(allow ? allow->size() : (size_t)nPI);
+        invMask.reserve(allow ? allow->size() : (size_t)nPI1);
 
         auto testOne = [&](int pi1) -> uint8_t {
             bool ok0 = true; // no PI inversion on c2
@@ -632,15 +799,64 @@ static bool buildPiCandidatesFromPoMap(const UnateTable& t1,
                 if (m) { cand.push_back(pi1); invMask.push_back(m); }
             }
         } else {
-            for (int pi1 = 0; pi1 < nPI; pi1++) {
+            for (int pi1 = 0; pi1 < nPI1; pi1++) {
                 uint8_t m = testOne(pi1);
                 if (m) { cand.push_back(pi1); invMask.push_back(m); }
             }
         }
 
+        // If strict unate-compatibility yields no candidate, fall back to a soft score
+        // (min mismatches over POs). This keeps the solver moving on cases where the
+        // unate table is insufficient/noisy. SAT/witness will ultimately validate.
+        if (cand.empty()) {
+            struct Sc { int bestMis; int pi1; uint8_t mask; };
+            std::vector<Sc> scored;
+            const std::vector<int>* fallAllow = allow;
+            if (fallAllow) scored.reserve(fallAllow->size());
+            else scored.reserve((size_t)nPI1);
+
+            auto scoreOne = [&](int pi1) {
+                int mis0 = 0, mis1 = 0;
+                for (int po2 = 0; po2 < nPO; ++po2) {
+                    int po1 = poMap[po2];
+                    if (po1 < 0) continue;
+                    char a = t1.rel[po1][pi1];
+                    char b = t2.rel[po2][pi2];
+                    if (!relCompatibleInv(a, b, rowFlip[po2], false)) mis0++;
+                    if (!relCompatibleInv(a, b, rowFlip[po2], true))  mis1++;
+                }
+                int best = std::min(mis0, mis1);
+                uint8_t m = 0;
+                if (mis0 <= mis1) m |= 1;
+                if (mis1 <= mis0) m |= 2;
+                scored.push_back({best, pi1, m});
+            };
+
+            if (fallAllow) {
+                for (int pi1 : *fallAllow) scoreOne(pi1);
+            } else {
+                for (int pi1 = 0; pi1 < nPI1; ++pi1) scoreOne(pi1);
+            }
+
+            std::stable_sort(scored.begin(), scored.end(),
+                             [](const Sc& a, const Sc& b){ return a.bestMis < b.bestMis; });
+
+            const int topK = 8;
+            int keep = std::min(topK, (int)scored.size());
+            if (keep < (int)scored.size()) {
+                int bound = scored[keep - 1].bestMis;
+                while (keep < (int)scored.size() && scored[keep].bestMis == bound) keep++;
+            }
+            cand.reserve(keep);
+            invMask.reserve(keep);
+            for (int i = 0; i < keep; ++i) {
+                cand.push_back(scored[i].pi1);
+                invMask.push_back(scored[i].mask ? scored[i].mask : 3);
+            }
+        }
+
         piCand[pi2] = std::move(cand);
         piCandInvMask[pi2] = std::move(invMask);
-        if (piCand[pi2].empty()) return false;
     }
     return true;
 }
@@ -690,6 +906,77 @@ static vector<char> chooseRowFlipHeuristic(const UnateTable& t1,
         flip[po2] = (scoreFl < scoreNo) ? 1 : 0;
     }
     return flip;
+}
+
+// Build a PI mapping using maximum matching (one-to-one) as a backbone, then
+// assign remaining PIs (if |PI2| > |PI1|) by allowing duplicates.
+//
+// piCand[pi2] is assumed to be ordered from best to worst.
+static bool buildPiMapUsingHK(const vector<vector<int>>& piCand,
+                              const vector<vector<uint8_t>>& piCandInvMask,
+                              int nPI1,
+                              std::mt19937& rng,
+                              vector<int>& piMap,
+                              vector<char>& piFlip) {
+    const int nPI2 = (int)piCand.size();
+    piMap.assign(nPI2, -1);
+    piFlip.assign(nPI2, 0);
+
+    // Build adjacency for HK (cap per PI2 to keep it light).
+    const int kAdjCap = 16;
+    vector<vector<int>> adj(nPI2);
+    adj.reserve(nPI2);
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        const auto& c = piCand[pi2];
+        int take = std::min((int)c.size(), kAdjCap);
+        adj[pi2].assign(c.begin(), c.begin() + take);
+        // Shuffle within the cap to explore different max matchings.
+        std::shuffle(adj[pi2].begin(), adj[pi2].end(), rng);
+    }
+
+    vector<int> matchL, matchR;
+    (void)hopcroftKarpMax(adj, nPI1, matchL, &matchR);
+
+    // Use the HK matching as the backbone.
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        if (matchL[pi2] >= 0) piMap[pi2] = matchL[pi2];
+    }
+
+    // Fill the rest with best candidates (duplicates allowed).
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        if (piMap[pi2] >= 0) continue;
+        if (!piCand[pi2].empty()) {
+            piMap[pi2] = piCand[pi2][0];
+        } else {
+            piMap[pi2] = -1; // treated as const 0 unless piConstOne is set
+        }
+    }
+
+    // Decide PI inversion per PI2.
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        const int pi1 = piMap[pi2];
+        if (pi1 < 0) {
+            piFlip[pi2] = 0;
+            continue;
+        }
+        uint8_t m = 0;
+        const auto& c = piCand[pi2];
+        const auto& im = piCandInvMask[pi2];
+        for (int k = 0; k < (int)c.size() && k < (int)im.size(); ++k) {
+            if (c[k] == pi1) { m = im[k]; break; }
+        }
+        if (m == 0) {
+            piFlip[pi2] = 0;
+        } else if (m == 1) {
+            piFlip[pi2] = 0;
+        } else if (m == 2) {
+            piFlip[pi2] = 1;
+        } else {
+            // both ok
+            piFlip[pi2] = (char)(rng() & 1);
+        }
+    }
+    return true;
 }
 
 static bool randomPerfectMatchPI(const vector<vector<int>>& cand,
@@ -757,18 +1044,30 @@ static MatchResult makeGuessFromMaps(const UnateTable& t1,
                                     const vector<int>& poMap,
                                     const vector<char>& rowFlip,
                                     const vector<int>& piMap,
-                                    const vector<char>& piFlip) {
+                                    const vector<char>& piFlip,
+                                    const vector<char>& piConstOne) {
     MatchResult r;
     r.success = false;
 
     r.piPairs.reserve(t2.nPI);
+    r.constBinds.reserve(8);
     for (int pi2 = 0; pi2 < t2.nPI; pi2++) {
         int pi1 = piMap[pi2];
-        InPortMatch ip;
-        ip.c1_pi = t1.piNetIds[pi1];
-        ip.c2_pi = t2.piNetIds[pi2];
-        ip.c2Neg = (piFlip[pi2] != 0);
-        r.piPairs.push_back(ip);
+        if (pi1 >= 0) {
+            InPortMatch ip;
+            ip.c1_pi = t1.piNetIds[pi1];
+            ip.c2_pi = t2.piNetIds[pi2];
+            ip.c2_neg = (piFlip[pi2] != 0);
+            r.piPairs.push_back(ip);
+        } else {
+            ConstBind cb;
+            cb.c2_pi = t2.piNetIds[pi2];
+            // Input inversion flips constants too.
+            bool v = (piConstOne[pi2] != 0);
+            if (piFlip[pi2]) v = !v;
+            cb.bind_one = v;
+            r.constBinds.push_back(cb);
+        }
     }
 
     r.poPairs.reserve(t2.nPO);
@@ -777,7 +1076,7 @@ static MatchResult makeGuessFromMaps(const UnateTable& t1,
         OutPortMatch op;
         op.c1_po = t1.poNetIds[po1];
         op.c2_po = t2.poNetIds[po2];
-        op.c2Neg = (rowFlip[po2] != 0);
+        op.c2_neg = (rowFlip[po2] != 0);
         r.poPairs.push_back(op);
     }
 
@@ -830,6 +1129,174 @@ static inline uint64_t randU64(std::mt19937& rng) {
     return (hi << 32) | lo;
 }
 
+// ------------------------
+// Influence signatures (PI->PO correlation)
+// ------------------------
+// For each PI and each PO, compute an inversion-invariant correlation score:
+//   score = | P(PO=1 | PI=1) - P(PO=1 | PI=0) |
+// This is invariant under:
+//   * PO inversion (PO -> !PO): probabilities complement, difference unchanged.
+//   * PI inversion (PI -> !PI): swaps conditions, absolute value unchanged.
+// It is also insensitive to PO ordering if we only use permutation-invariant
+// summaries (coarse filter).
+static std::vector<std::vector<uint8_t>> computeInfluenceQuant(const Circuit& c,
+                                                               const std::vector<int>& topo,
+                                                               std::mt19937& rng,
+                                                               int batches) {
+    const int nPI = (int)c.PIs.size();
+    const int nPO = (int)c.POs.size();
+    std::vector<std::vector<uint32_t>> cnt11(nPI, std::vector<uint32_t>(nPO, 0));
+    std::vector<std::vector<uint32_t>> cnt01(nPI, std::vector<uint32_t>(nPO, 0));
+    std::vector<uint32_t> cntPi1(nPI, 0);
+    std::vector<uint32_t> cntPi0(nPI, 0);
+
+    for (int b = 0; b < batches; ++b) {
+        std::vector<uint64_t> piMask(nPI);
+        for (int i = 0; i < nPI; ++i) piMask[i] = randU64(rng);
+        const std::vector<uint64_t> out = simulateCircuit64(c, topo, piMask, c.POs);
+        for (int i = 0; i < nPI; ++i) {
+            const uint64_t m1 = piMask[i];
+            const uint64_t m0 = ~m1;
+            cntPi1[i] += (uint32_t)__builtin_popcountll(m1);
+            cntPi0[i] += (uint32_t)__builtin_popcountll(m0);
+            for (int po = 0; po < nPO; ++po) {
+                const uint64_t o = out[po];
+                cnt11[i][po] += (uint32_t)__builtin_popcountll(o & m1);
+                cnt01[i][po] += (uint32_t)__builtin_popcountll(o & m0);
+            }
+        }
+    }
+
+    // Quantize to 0..255 per (pi,po)
+    std::vector<std::vector<uint8_t>> q(nPI, std::vector<uint8_t>(nPO, 0));
+    for (int i = 0; i < nPI; ++i) {
+        const double d1 = std::max(1u, cntPi1[i]);
+        const double d0 = std::max(1u, cntPi0[i]);
+        for (int po = 0; po < nPO; ++po) {
+            const uint32_t c11 = cnt11[i][po];
+            const uint32_t c01 = cnt01[i][po];
+            const double p1 = (double)c11 / d1;
+            const double p0 = (double)c01 / d0;
+            const double diff = std::abs(p1 - p0);
+            int v = (int)std::lround(diff * 255.0);
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            q[i][po] = (uint8_t)v;
+        }
+    }
+    return q;
+}
+
+struct InflCoarseFeat {
+    uint16_t top4[4];
+    uint16_t sum;
+    uint16_t nz;
+    uint16_t hist8[8];
+};
+
+static InflCoarseFeat makeInflCoarseFeat(const std::vector<uint8_t>& v) {
+    InflCoarseFeat f{};
+    f.sum = 0;
+    f.nz = 0;
+    for (int b = 0; b < 8; ++b) f.hist8[b] = 0;
+
+    // top4 selection (small nPO so simple sort is fine)
+    std::vector<uint16_t> tmp;
+    tmp.reserve(v.size());
+    for (uint8_t x : v) {
+        f.sum = (uint16_t)(f.sum + x);
+        if (x) f.nz++;
+        f.hist8[x >> 5]++; // 0..7
+        tmp.push_back((uint16_t)x);
+    }
+    std::sort(tmp.begin(), tmp.end(), std::greater<uint16_t>());
+    for (int i = 0; i < 4; ++i) f.top4[i] = (i < (int)tmp.size()) ? tmp[i] : 0;
+    return f;
+}
+
+static inline int inflCoarseDist(const InflCoarseFeat& a, const InflCoarseFeat& b) {
+    int d = 0;
+    d += std::abs((int)a.sum - (int)b.sum);
+    d += std::abs((int)a.nz  - (int)b.nz) * 8;
+    for (int i = 0; i < 4; ++i) d += std::abs((int)a.top4[i] - (int)b.top4[i]);
+    for (int i = 0; i < 8; ++i) d += std::abs((int)a.hist8[i] - (int)b.hist8[i]) * 4;
+    return d;
+}
+
+// Coarse prune (PO-permutation invariant): keep only topK PI1 candidates per PI2.
+static void coarsePrunePiAllowed(const std::vector<InflCoarseFeat>& feat1,
+                                const std::vector<InflCoarseFeat>& feat2,
+                                int topK,
+                                std::vector<std::vector<int>>& allowedPi1) {
+    if (topK <= 0) return;
+    for (int pi2 = 0; pi2 < (int)allowedPi1.size(); ++pi2) {
+        auto& cand = allowedPi1[pi2];
+        if ((int)cand.size() <= topK) continue;
+        std::vector<std::pair<int,int>> scored;
+        scored.reserve(cand.size());
+        for (int pi1 : cand) {
+            scored.push_back({inflCoarseDist(feat1[pi1], feat2[pi2]), pi1});
+        }
+        std::sort(scored.begin(), scored.end(), [](const auto& x, const auto& y){
+            if (x.first != y.first) return x.first < y.first;
+            return x.second < y.second;
+        });
+        int keep = std::min(topK, (int)scored.size());
+        if (keep < (int)scored.size()) {
+            int bound = scored[keep-1].first;
+            while (keep < (int)scored.size() && scored[keep].first == bound) keep++;
+        }
+        cand.clear();
+        cand.reserve(keep);
+        for (int i = 0; i < keep; ++i) cand.push_back(scored[i].second);
+    }
+}
+
+// Fine prune (PO-aligned): keep topK by aligned L1 distance under a PO mapping.
+static void finePrunePiCandByInfluence(const std::vector<std::vector<uint8_t>>& infl1,
+                                      const std::vector<std::vector<uint8_t>>& infl2,
+                                      const std::vector<int>& poMap,
+                                      int topK,
+                                      std::vector<std::vector<int>>& piCand,
+                                      std::vector<std::vector<uint8_t>>& piCandInvMask) {
+    if (topK <= 0) return;
+    const int nPO2 = (int)poMap.size();
+    for (int pi2 = 0; pi2 < (int)piCand.size(); ++pi2) {
+        auto& cand = piCand[pi2];
+        auto& msk  = piCandInvMask[pi2];
+        if ((int)cand.size() <= topK) continue;
+        std::vector<std::tuple<int,int,uint8_t>> scored; // dist, pi1, mask
+        scored.reserve(cand.size());
+        for (int k = 0; k < (int)cand.size(); ++k) {
+            const int pi1 = cand[k];
+            int d = 0;
+            for (int po2 = 0; po2 < nPO2; ++po2) {
+                const int po1 = poMap[po2];
+                if (po1 < 0) continue;
+                d += std::abs((int)infl1[pi1][po1] - (int)infl2[pi2][po2]);
+            }
+            scored.emplace_back(d, pi1, msk[k]);
+        }
+        std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b){
+            if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) < std::get<0>(b);
+            return std::get<1>(a) < std::get<1>(b);
+        });
+        int keep = std::min(topK, (int)scored.size());
+        if (keep < (int)scored.size()) {
+            int bound = std::get<0>(scored[keep-1]);
+            while (keep < (int)scored.size() && std::get<0>(scored[keep]) == bound) keep++;
+        }
+        cand.clear();
+        msk.clear();
+        cand.reserve(keep);
+        msk.reserve(keep);
+        for (int i = 0; i < keep; ++i) {
+            cand.push_back(std::get<1>(scored[i]));
+            msk.push_back(std::get<2>(scored[i]));
+        }
+    }
+}
+
 
 static vector<uint8_t> computePoBiasQuant(const Circuit& c,
                                          const vector<int>& topo,
@@ -873,6 +1340,7 @@ static bool passesRandomSimOrAddWitness(const Circuit& c1,
                                        const vector<int>& piMap,
                                        const vector<char>& rowFlip,
                                        const vector<char>& piFlip,
+                                       const vector<char>& piConstOne,
                                        std::mt19937& rng,
                                        vector<WitnessBits>& witnesses,
                                        std::unordered_set<uint64_t>& witnessHash,
@@ -889,7 +1357,12 @@ static bool passesRandomSimOrAddWitness(const Circuit& c1,
     vector<uint64_t> piMask2(nPI2, 0);
     for (int pi2 = 0; pi2 < nPI2; ++pi2) {
         int pi1 = piMap[pi2];
-        uint64_t m = piMask1[pi1];
+        uint64_t m = 0;
+        if (pi1 >= 0) {
+            m = piMask1[pi1];
+        } else {
+            m = piConstOne[pi2] ? ~0ULL : 0ULL;
+        }
         if (piFlip[pi2]) m = ~m;
         piMask2[pi2] = m;
     }
@@ -935,6 +1408,7 @@ static bool passesAllWitnessesBatched(const Circuit& c1,
                                       const vector<int>& piMap,
                                       const vector<char>& rowFlip,
                                       const vector<char>& piFlip,
+                                      const vector<char>& piConstOne,
                                       const vector<WitnessBits>& witnesses) {
     if (witnesses.empty()) return true;
 
@@ -959,7 +1433,12 @@ static bool passesAllWitnessesBatched(const Circuit& c1,
         vector<uint64_t> piMask2(nPI2, 0);
         for (int pi2 = 0; pi2 < nPI2; ++pi2) {
             int pi1 = piMap[pi2];
-            uint64_t m = piMask1[pi1];
+            uint64_t m = 0;
+            if (pi1 >= 0) {
+                m = piMask1[pi1];
+            } else {
+                m = piConstOne[pi2] ? activeMask : 0ULL;
+            }
             if (piFlip[pi2]) m = ~m;
             piMask2[pi2] = m;
         }
@@ -1003,10 +1482,12 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
     best.success = false;
     best.msg = "No solution tried yet.";
 
-    if (c1.PIs.size() != c2.PIs.size() || c1.POs.size() != c2.POs.size()) {
-        best.msg = "PI/PO count mismatch: c1 has PI=" + std::to_string(c1.PIs.size()) +
-                   " PO=" + std::to_string(c1.POs.size()) + ", c2 has PI=" +
-                   std::to_string(c2.PIs.size()) + " PO=" + std::to_string(c2.POs.size());
+    // This contest format allows Circuit-II inputs to be many-to-one mapped to Circuit-I inputs,
+    // and also to be tied to constants. Therefore PI counts may legitimately differ.
+    // (We still assume the benchmark has the same number of outputs in both circuits.)
+    if (c1.POs.size() != c2.POs.size()) {
+        best.msg = "PO count mismatch: c1 has PO=" + std::to_string(c1.POs.size()) +
+                   ", c2 has PO=" + std::to_string(c2.POs.size());
         return best;
     }
 
@@ -1018,8 +1499,14 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
     const auto piKey1 = computeColReducedKeys(t1);
     const auto piKey2 = computeColReducedKeys(t2);
 
-    const int nPO = t2.nPO;
-    const int nPI = t2.nPI;
+    // Lightweight column signatures (I,B,U counts) for scoring PI candidates.
+    // This is invariant to PI inversion (because P/N are both counted as U).
+    const auto piIBU1 = allColIBU(t1);
+    const auto piIBU2 = allColIBU(t2);
+
+    const int nPO  = t2.nPO;
+    const int nPI1 = t1.nPI;
+    const int nPI2 = t2.nPI;
 
     // topo order for fast 64-bit simulation
     vector<int> topo1 = topoSortGates(c1);
@@ -1030,6 +1517,19 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
 std::mt19937 rngBias = rng;
 const vector<uint8_t> poBias1 = computePoBiasQuant(c1, topo1, rngBias, 16);
 const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
+
+    // Influence signatures: coarse (T=256) for PO-permutation-invariant pruning,
+    // and fine (T=512) for PO-aligned pruning after we obtain a PO mapping.
+    const int kInfluenceTopK = 6;
+    std::mt19937 rngInfl = rng;
+    auto infl1_coarse = computeInfluenceQuant(c1, topo1, rngInfl, 4); // 4*64 = 256
+    auto infl2_coarse = computeInfluenceQuant(c2, topo2, rngInfl, 4);
+    auto infl1_fine   = computeInfluenceQuant(c1, topo1, rngInfl, 8); // 8*64 = 512
+    auto infl2_fine   = computeInfluenceQuant(c2, topo2, rngInfl, 8);
+
+    std::vector<InflCoarseFeat> inflFeat1(nPI1), inflFeat2(nPI2);
+    for (int i = 0; i < nPI1; ++i) inflFeat1[i] = makeInflCoarseFeat(infl1_coarse[i]);
+    for (int i = 0; i < nPI2; ++i) inflFeat2[i] = makeInflCoarseFeat(infl2_coarse[i]);
 
     // ------------------------
     // (1) Build bus groups & bus mapping samples (input buses and output buses separately)
@@ -1055,14 +1555,9 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
         return best;
     }
 
-    // Another quick sanity: non-bus ports count must match too (otherwise strict bus constraint impossible)
-    if (inNon1.size() != inNon2.size() || outNon1.size() != outNon2.size()) {
-        best.msg = "Non-bus port count mismatch under strict bus constraint (inputNon: c1=" +
-                   std::to_string(inNon1.size()) + " c2=" + std::to_string(inNon2.size()) +
-                   ", outputNon: c1=" + std::to_string(outNon1.size()) + " c2=" +
-                   std::to_string(outNon2.size()) + ")";
-        return best;
-    }
+    // Note: PI counts can differ. Extra circuit-II inputs are allowed and can be mapped
+    // many-to-one onto circuit-I inputs (or even constants). Therefore, we do NOT require
+    // the number of non-bus ports to match.
 
     // Build bus adjacency and sample matchings.
     std::vector<std::vector<int>> inAdj, outAdj;
@@ -1070,8 +1565,13 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
 
     std::vector<std::vector<int>> inBusMatchings;
     if (!inB2.empty()) {
-        if (!buildBusAdj(inB1, inB2, topKBus, inAdj)) {
-            best.msg = "Failed to build input-bus adjacency (width/signature mismatch?)";
+        // Allow input-bus width mismatch up to the PI-count delta (common when c2
+        // contains duplicated / expanded input buses). Also apply aggregated
+        // (I,B,U) dominance constraints.
+        const int piSlack = std::abs((int)c2.PIs.size() - (int)c1.PIs.size());
+        // buildBusAdjFlexInput args: (topK, maxExtraBits)
+        if (!buildBusAdjFlexInput(inB1, inB2, topKBus, piSlack, inAdj)) {
+            best.msg = "Failed to build input-bus adjacency (constraints too tight?)";
             return best;
         }
         // If bus count is small, enumerate multiple matchings directly.
@@ -1181,15 +1681,21 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
 
         // Hard prune PI candidates by inversion-invariant column signature.
         // (P/N merged into U) => safe under input negation.
-        bool piKeyOk = true;
-        for (int pi2 = 0; pi2 < nPI; ++pi2) {
+        for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+            // Keep the original candidate set as a fallback: sometimes the reduced-key
+            // signature is too strict when PI counts mismatch or the unate table is noisy.
+            auto orig = allowedPi1[pi2];
             auto& vec = allowedPi1[pi2];
             vec.erase(std::remove_if(vec.begin(), vec.end(), [&](int pi1){
                 return piKey1[pi1] != piKey2[pi2];
             }), vec.end());
-            if (vec.empty()) { piKeyOk = false; break; }
+            if (vec.empty()) vec = std::move(orig);
         }
-        if (!piKeyOk) continue;
+
+        // Coarse influence pruning (PO-permutation invariant): keep only top-K candidates
+        // based on coarse influence summaries. This dramatically reduces HK search space
+        // when unate tables are not discriminative.
+        coarsePrunePiAllowed(inflFeat1, inflFeat2, kInfluenceTopK, allowedPi1);
 
         // Build PO ordering (restricted by bus)
         vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, rng);
@@ -1201,32 +1707,66 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                 adjPO[po2].assign(poOrd[po2].begin(), poOrd[po2].begin() + k);
             }
 
-            vector<int> poMap;
-            if (!hopcroftKarp(adjPO, nPO, poMap)) { hkFailPO++; return false; }
+	            vector<int> poMap;
+	            if (!hopcroftKarp(adjPO, nPO, poMap)) { hkFailPO++; return false; }
 
-            vector<char> rowFlip = chooseRowFlipHeuristic(t1, t2, poMap, poBias1, poBias2);
+	            // -------------------------------------------------
+	            // Row-flip handling
+	            //
+	            // NOTE: rowFlip affects PI candidate construction.
+	            // For small-PO cases (common in early contest cases),
+	            // the heuristic rowFlip may be wrong and will cause the
+	            // witness filter to reject almost everything (satCalls=0).
+	            //
+	            // To make small cases robust, we enumerate ALL rowFlip
+	            // assignments when nPO is small, prioritizing those close
+	            // to the heuristic.
+	            // -------------------------------------------------
+	            vector<char> rowFlipHeu = chooseRowFlipHeuristic(t1, t2, poMap, poBias1, poBias2);
+	            uint32_t heuMask = 0;
+	            for (int po2 = 0; po2 < nPO && po2 < 32; ++po2) {
+	                if (rowFlipHeu[po2]) heuMask |= (1u << po2);
+	            }
+	            const int kMaxEnumPO = 10; // 2^10 = 1024, cheap
+	            std::vector<uint32_t> flipMasks;
+	            if (nPO <= kMaxEnumPO) {
+	                const uint32_t full = (nPO == 32 ? 0xFFFFFFFFu : ((1u << nPO) - 1u));
+	                flipMasks.reserve((size_t)1u << nPO);
+	                for (uint32_t m = 0; m <= full; ++m) flipMasks.push_back(m);
+	                std::sort(flipMasks.begin(), flipMasks.end(), [&](uint32_t a, uint32_t b) {
+	                    return __builtin_popcount((a ^ heuMask) & full) < __builtin_popcount((b ^ heuMask) & full);
+	                });
+	            } else {
+	                flipMasks.push_back(heuMask);
+	            }
 
-            vector<vector<int>> piCand;
-            vector<vector<uint8_t>> piCandInvMask;
-            if (!buildPiCandidatesFromPoMap(t1, t2, poMap, rowFlip, allowedPi1, piCand, piCandInvMask)) {
-                buildPiFail++; return false;
-            }
+	            for (uint32_t mFlip : flipMasks) {
+	                vector<char> rowFlip(nPO, 0);
+	                for (int po2 = 0; po2 < nPO && po2 < 32; ++po2) rowFlip[po2] = ((mFlip >> po2) & 1u) ? 1 : 0;
 
-            vector<int> piMapHK;
-            if (!hopcroftKarp(piCand, nPI, piMapHK)) { hkFailPI++; return false; }
+	                vector<vector<int>> piCand;
+	                vector<vector<uint8_t>> piCandInvMask;
+	                buildPiCandidatesFromPoMap(t1, t2, poMap, rowFlip, allowedPi1, piCand, piCandInvMask);
 
-            for (int attempt = 0; attempt < piTriesPerPO; attempt++) {
-                vector<int> piMap = piMapHK;
-                if (!randomPerfectMatchPI(piCand, rng, piMap)) { randPiFail++; continue; }
+                // Fine influence pruning (PO-aligned): further trim each PI's candidate list
+                // using aligned influence distance under the current PO mapping.
+                finePrunePiCandByInfluence(infl1_fine, infl2_fine, poMap, kInfluenceTopK, piCand, piCandInvMask);
 
-                vector<char> piFlip;
-                if (!derivePiFlipForMap(piCand, piCandInvMask, piMap, piFlip)) { randPiFail++; continue; }
+	                const int piAttempts = std::max(1, std::min(piTriesPerPO, 24));
+	                for (int attempt = 0; attempt < piAttempts; attempt++) {
+	                    std::vector<int>  piMap;
+	                    std::vector<char> piFlip;
+	                    std::vector<char> piConstOne(nPI2, 0);
+	                    const bool ok = buildPiMapUsingHK(
+	                        piCand, piCandInvMask, nPI1,
+	                        rng, piMap, piFlip);
+	                    if (!ok) { hkFailPI++; randPiFail++; continue; }
 
-                MatchResult guess = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip);
-                lastTried = guess;
+	                    MatchResult guess = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip, piConstOne);
+	                    lastTried = guess;
 
-                triesTotal++;
-                triesCombo++;
+	                    triesTotal++;
+	                    triesCombo++;
                 {
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - tLastLog).count() >= 1) {
@@ -1249,20 +1789,20 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                     }
                 }
 
-                if (!passesAllWitnessesBatched(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip, witnesses)) {
-                    witnessReject++;
-                    continue;
-                }
+	                    if (!passesAllWitnessesBatched(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip, piConstOne, witnesses)) {
+	                        witnessReject++;
+	                        continue;
+	                    }
 
                 // Extra cheap pruning: 64-pattern random simulation.
                 // If it fails, we extract ONE failing bit as a witness (CEGIS) and skip SAT.
-                if (!passesRandomSimOrAddWitness(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip,
-                                               rng, witnesses, witnessHash, kMaxWitnesses)) {
-                    simReject++;
-                    continue;
-                }
+	                    if (!passesRandomSimOrAddWitness(c1, c2, topo1, topo2, poMap, piMap, rowFlip, piFlip, piConstOne,
+	                                                   rng, witnesses, witnessHash, kMaxWitnesses)) {
+	                        simReject++;
+	                        continue;
+	                    }
 
-                satCalls++;
+	                    satCalls++;
                 {
                     using namespace std::chrono;
                     auto now = steady_clock::now();
@@ -1273,9 +1813,9 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                               << " t=" << sec << "s\n";
                 }
 
-                auto tSat0 = std::chrono::steady_clock::now();
-                SatCheckResult satRes = checkMatchBySAT(c1, c2, guess);
-                auto tSat1 = std::chrono::steady_clock::now();
+	                    auto tSat0 = std::chrono::steady_clock::now();
+	                    SatCheckResult satRes = checkMatchBySAT(c1, c2, guess);
+	                    auto tSat1 = std::chrono::steady_clock::now();
                 {
                     using namespace std::chrono;
                     auto ms = duration_cast<milliseconds>(tSat1 - tSat0).count();
@@ -1284,33 +1824,34 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                               << " ms=" << ms
                               << " badPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
                 }
-                lastSat = satRes;
-                if (satRes.success) {
-                    guess.success = true;
-                    guess.msg = "SAT UNSAT miter: equivalent mapping found.";
-                    best = guess;
-                    return true;
-                }
+	                    lastSat = satRes;
+	                    if (satRes.success) {
+	                        guess.success = true;
+	                        guess.msg = "SAT UNSAT miter: equivalent mapping found.";
+	                        best = guess;
+	                        return true;
+	                    }
 
                 // de-dup witnesses
-                {
-                    WitnessBits w = buildWitnessFromSat(c1, satRes.c1PiWitness);
-                    uint64_t h = hashWitnessBits(w);
-                    if ((int)witnesses.size() < kMaxWitnesses && witnessHash.insert(h).second) {
-                        witnesses.push_back(std::move(w));
-                        std::cerr << "[UnateBus] add SAT-witness#" << witnesses.size()
-                                  << " badPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
-                    }
-                }
-            }
+	                    {
+	                        WitnessBits w = buildWitnessFromSat(c1, satRes.c1PiWitness);
+	                        uint64_t h = hashWitnessBits(w);
+	                        if ((int)witnesses.size() < kMaxWitnesses && witnessHash.insert(h).second) {
+	                            witnesses.push_back(std::move(w));
+	                            std::cerr << "[UnateBus] add SAT-witness#" << witnesses.size()
+	                                      << " badPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
+	                        }
+	                    }
+	                }
+	            }
 
-            return false;
+	            return false;
         };
 
         for (int it = 0; it < maxCegisIters; it++) {
             bool madeAttempt = false;
 
-            int KpoStart = std::min(8, nPO);
+            int KpoStart = std::min(16, nPO);
             int KpoMax = nPO;
 
             for (int Kpo = KpoStart; ; ) {
@@ -1323,7 +1864,8 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                     curIt = it;
                     curKpo = Kpo;
                     if (tryOneGuess(Kpo)) {
-                        std::cerr << "[UnateBus] success=true  PI=" << nPI << "/" << nPI
+                        std::cerr << "[UnateBus] success=true  PI=" << nPI2 << "/" << nPI2
+                                  << " (c1PI=" << nPI1 << ")"
                                   << "  PO=" << nPO << "/" << nPO
                                   << " combo=" << comboIdx << " it=" << it << "\n";
                         return best;
@@ -1340,7 +1882,8 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
         }
     }
 
-    std::cerr << "[UnateBus] success=false  PI=" << nPI << "/" << nPI
+    std::cerr << "[UnateBus] success=false  PI=" << nPI2 << "/" << nPI2
+              << " (c1PI=" << nPI1 << ")"
               << "  PO=" << nPO << "/" << nPO << "\n";
 
     if (!lastTried.piPairs.empty() && !lastTried.poPairs.empty()) {

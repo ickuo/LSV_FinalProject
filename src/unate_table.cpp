@@ -41,7 +41,7 @@ static inline char relCharFromToken(const std::string& tokRaw) {
     if (!tok.empty() && (tok.back()  == '"' || tok.back()  == '\'')) tok.pop_back();
 
     tok = trim(tok);
-    if (tok.empty()) return 'I';
+    if (tok.empty()) return 'X';
 
     // upper first alphabetic
     char c = 0;
@@ -50,6 +50,7 @@ static inline char relCharFromToken(const std::string& tokRaw) {
         if (std::isalpha((unsigned char)ch)) { c = (char)std::toupper((unsigned char)ch); break; }
     }
     if (c == 'P' || c == 'N' || c == 'B' || c == 'I') return c;
+    if (c == 'X') return 'X';
 
     // some tools write words
     std::string u;
@@ -59,8 +60,10 @@ static inline char relCharFromToken(const std::string& tokRaw) {
     if (u.find("NEG") != std::string::npos) return 'N';
     if (u.find("BIN") != std::string::npos) return 'B';
     if (u.find("IND") != std::string::npos) return 'I';
+    if (u.find("UNK") != std::string::npos) return 'X';
+    if (u.find("X")   != std::string::npos) return 'X';
 
-    return 'I';
+    return 'X';
 }
 
 } // namespace
@@ -77,7 +80,8 @@ UnateTable UnateTable::loadFromCSV(const std::string& csvPath, const Circuit& c)
     t.nPO = (int)t.poNetIds.size();
     t.nPI = (int)t.piNetIds.size();
 
-    t.rel.assign(t.nPO, std::vector<char>(t.nPI, 'I'));
+    // Default to 'X' (unknown/unspecified) instead of assuming independent.
+    t.rel.assign(t.nPO, std::vector<char>(t.nPI, 'X'));
 
     // netId -> poIdx/piIdx
     std::vector<int> netToPoIdx(c.nets.size(), -1);

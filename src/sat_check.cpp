@@ -189,12 +189,53 @@ SatCheckResult checkMatchBySAT(const Circuit& c1, const Circuit& c2, const Match
         addGateCNF(solver, g.type, o, ins);
     }
 
-    // ---- Tie matched PIs (allow optional inversion on c2 side)
+    // ---- Tie circuit2 PIs
+    // Each circuit2 PI must be either:
+    //   (a) tied to a circuit1 PI (possibly inverted), or
+    //   (b) tied to a constant (CONSTGROUP).
+    std::unordered_map<int,int> c2PiIndexByNet;
+    c2PiIndexByNet.reserve(c2.PIs.size());
+    for (int i = 0; i < (int)c2.PIs.size(); ++i) c2PiIndexByNet[c2.PIs[i]] = i;
+    std::vector<char> c2PiBound(c2.PIs.size(), 0);
+
+    // (a) PI-to-PI binds
     for (const auto& pr : m.piPairs) {
+        auto it = c2PiIndexByNet.find(pr.c2_pi);
+        if (it == c2PiIndexByNet.end()) {
+            out.success = false;
+            out.msg = "Mapping error: c2_pi not found in c2.PIs";
+            return out;
+        }
+        c2PiBound[it->second] = 1;
+
         int v1 = netVar(base1, pr.c1_pi);
         int v2 = netVar(base2, pr.c2_pi);
-        if (!pr.c2Neg) addEq(solver, v1, v2);
-        else           addEqNeg(solver, v1, v2);
+        if (!pr.c2_neg) addEq(solver, v1, v2);
+        else            addEqNeg(solver, v1, v2);
+    }
+
+    // (b) Constant binds
+    for (const auto& cb : m.constBinds) {
+        auto it = c2PiIndexByNet.find(cb.c2_pi);
+        if (it == c2PiIndexByNet.end()) {
+            out.success = false;
+            out.msg = "Mapping error: const c2_pi not found in c2.PIs";
+            return out;
+        }
+        c2PiBound[it->second] = 1;
+
+        int v2 = netVar(base2, cb.c2_pi);
+        solver.addClause({ cb.bind_one ? v2 : -v2 });
+    }
+
+    // Safety: if any circuit2 PI is unbound, the SAT problem would allow it to float,
+    // producing false counterexamples.
+    for (int i = 0; i < (int)c2PiBound.size(); ++i) {
+        if (!c2PiBound[i]) {
+            out.success = false;
+            out.msg = "Mapping error: some c2 PIs are unbound (missing in INGROUP/CONSTGROUP).";
+            return out;
+        }
     }
 
     // ---- Miter on matched POs
@@ -208,10 +249,10 @@ SatCheckResult checkMatchBySAT(const Circuit& c1, const Circuit& c2, const Match
         int d = ++numVars;
         solver.ensureVars(numVars);
 
-        // If pr.c2Neg==0: d = XOR(o1,o2)
-        // If pr.c2Neg==1: compare o1 vs ~o2 => d = XOR(o1,~o2) = XNOR(o1,o2)
-        if (!pr.c2Neg) addXor2(solver, d, o1, o2);
-        else           addXnor2(solver, d, o1, o2);
+        // If pr.c2_neg==0: d = XOR(o1,o2)
+        // If pr.c2_neg==1: compare o1 vs ~o2 => d = XOR(o1,~o2) = XNOR(o1,o2)
+        if (!pr.c2_neg) addXor2(solver, d, o1, o2);
+        else            addXnor2(solver, d, o1, o2);
 
         diffVars.push_back(d);
     }
