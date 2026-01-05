@@ -60,4 +60,5 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
                              int maxCegisIters = 60,
                              int poTries = 600,
                              int piTriesPerPO = 80,
-                             int seed = 0);
+                             int seed = 0,
+                             int timeoutSwitchSeconds = 3200);

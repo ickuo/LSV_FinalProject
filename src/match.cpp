@@ -8,11 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <random>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -53,6 +56,21 @@ struct RowFeat {
     int nPI   = 0;
     std::string refKey;
 };
+
+
+struct PoSig {
+    uint8_t bias = 0;                 // 0..255
+    std::vector<uint8_t> absCorrHist; // size=bins, each 0..255 (normalized)
+};
+
+static inline int l1HistDist(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    int s = 0;
+    for (size_t i = 0; i < n; ++i) s += std::abs((int)a[i] - (int)b[i]);
+    for (size_t i = n; i < a.size(); ++i) s += (int)a[i];
+    for (size_t i = n; i < b.size(); ++i) s += (int)b[i];
+    return s;
+}
 
 static RowFeat makeRowFeat(const UnateTable& t, int poIdx) {
     RowFeat f;
@@ -666,61 +684,107 @@ static bool buildAllowedByBus(const Circuit& c1,
 // ------------------------
 // PO candidate order (bus-aware restriction)
 // ------------------------
+
 static vector<vector<int>> buildPOCandidateOrder(const UnateTable& t1,
-                                                 const UnateTable& t2,
-                                                 const std::vector<std::vector<int>>& allowedPo1,
-                                                 std::mt19937& rng) {
+                                                const UnateTable& t2,
+                                                const vector<vector<int>>& allowedPo1,
+                                                const vector<PoSig>& poSig1,
+                                                const vector<PoSig>& poSig2,
+                                                int sigTopK,
+                                                std::mt19937& rng) {
     vector<RowFeat> f1(t1.nPO), f2(t2.nPO);
 
-    auto ck1 = computeColReducedKeys(t1);
-    auto ck2 = computeColReducedKeys(t2);
+    const vector<string> colKeys1 = computeColReducedKeys(t1);
+    const vector<string> colKeys2 = computeColReducedKeys(t2);
 
-    for (int i = 0; i < t1.nPO; i++) {
-        f1[i] = makeRowFeat(t1, i);
-        f1[i].refKey = makeRowRefKey(t1, i, ck1, f1[i]);
+    for (int po = 0; po < t1.nPO; ++po) {
+        f1[po] = makeRowFeat(t1, po);
+        f1[po].refKey = makeRowRefKey(t1, po, colKeys1, f1[po]);
     }
-    for (int i = 0; i < t2.nPO; i++) {
-        f2[i] = makeRowFeat(t2, i);
-        f2[i].refKey = makeRowRefKey(t2, i, ck2, f2[i]);
+    for (int po = 0; po < t2.nPO; ++po) {
+        f2[po] = makeRowFeat(t2, po);
+        f2[po].refKey = makeRowRefKey(t2, po, colKeys2, f2[po]);
     }
+
+    const bool hasSig =
+        ((int)poSig1.size() == t1.nPO) &&
+        ((int)poSig2.size() == t2.nPO) &&
+        (!poSig1.empty()) &&
+        (poSig1[0].absCorrHist.size() == poSig2[0].absCorrHist.size());
+
+    sigTopK = std::max(4, sigTopK);
 
     vector<vector<int>> ord(t2.nPO);
+    std::uniform_int_distribution<int> tieRand(0, 0x7fff);
 
-    for (int po2 = 0; po2 < t2.nPO; po2++) {
-        const std::vector<int>* allow = nullptr;
-        if (!allowedPo1.empty()) allow = &allowedPo1[po2];
-
-        vector<std::pair<int,int>> scored;
-        scored.reserve(allow ? allow->size() : (size_t)t1.nPO);
-
-        if (allow) {
-            for (int po1 : *allow) {
-                int sc = rowFeatDistL1(f1[po1], f2[po2]);
-                if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
-                scored.push_back({sc, po1});
-            }
+    for (int po2 = 0; po2 < t2.nPO; ++po2) {
+        // build candidate list
+        vector<int> cand;
+        if (!allowedPo1.empty() && po2 < (int)allowedPo1.size() && !allowedPo1[po2].empty()) {
+            cand = allowedPo1[po2];
         } else {
-            for (int po1 = 0; po1 < t1.nPO; po1++) {
-                int sc = rowFeatDistL1(f1[po1], f2[po2]);
-                if (f1[po1].refKey == f2[po2].refKey) sc -= 1000000;
-                scored.push_back({sc, po1});
+            cand.resize(t1.nPO);
+            std::iota(cand.begin(), cand.end(), 0);
+        }
+
+        // whether we have any exact refKey among candidates
+        bool hasExactRef = false;
+        for (int po1 : cand) {
+            if (f1[po1].refKey == f2[po2].refKey) { hasExactRef = true; break; }
+        }
+
+        // signature scores + "front" set
+        vector<int> sigScoreOf(t1.nPO, 0);
+        vector<char> isFront(t1.nPO, 0);
+        if (hasSig) {
+            vector<std::pair<int,int>> tmp;
+            tmp.reserve(cand.size());
+            const int b2 = (int)poSig2[po2].bias;
+            for (int po1 : cand) {
+                const int b1 = (int)poSig1[po1].bias;
+                const int biasDiff = std::min(std::abs(b1 - b2), std::abs(b1 - (255 - b2)));
+                const int histDiff = l1HistDist(poSig1[po1].absCorrHist, poSig2[po2].absCorrHist);
+                const int sc = histDiff * 2 + biasDiff;
+                sigScoreOf[po1] = sc;
+                tmp.push_back({sc, po1});
+            }
+            std::sort(tmp.begin(), tmp.end());
+            const int best = tmp.empty() ? 0 : tmp.front().first;
+            const int slack = 32;
+            int picked = 0;
+            for (auto& p : tmp) {
+                if (picked < sigTopK || p.first <= best + slack) {
+                    isFront[p.second] = 1;
+                    picked++;
+                } else {
+                    break;
+                }
             }
         }
 
-        std::stable_sort(scored.begin(), scored.end(),
-                         [](const auto& a, const auto& b){ return a.first < b.first; });
+        vector<std::pair<long long,int>> scored;
+        scored.reserve(cand.size());
+        for (int po1 : cand) {
+            const int rowD = rowFeatDistL1(f1[po1], f2[po2]);
+            long long sc = (long long)rowD * 8192LL;
 
-        size_t i = 0;
-        while (i < scored.size()) {
-            size_t j = i + 1;
-            while (j < scored.size() && scored[j].first == scored[i].first) j++;
-            if (j - i > 1) std::shuffle(scored.begin() + (long)i, scored.begin() + (long)j, rng);
-            i = j;
+            if (hasSig) {
+                sc += (long long)sigScoreOf[po1];
+                if (isFront[po1]) sc -= 2000000LL; // soft front-load (HK uses first K)
+            }
+
+            if (hasExactRef && f1[po1].refKey == f2[po2].refKey) {
+                sc -= (1LL << 40);
+            }
+
+            sc += (long long)tieRand(rng);
+            scored.push_back({sc, po1});
         }
+        std::sort(scored.begin(), scored.end());
 
         ord[po2].clear();
         ord[po2].reserve(scored.size());
-        for (auto& pr : scored) ord[po2].push_back(pr.second);
+        for (auto& p : scored) ord[po2].push_back(p.second);
     }
 
     return ord;
@@ -1079,8 +1143,391 @@ static MatchResult makeGuessFromMaps(const UnateTable& t1,
         op.c2_neg = (rowFlip[po2] != 0);
         r.poPairs.push_back(op);
     }
+return r;
+}
 
-    return r;
+
+    
+
+
+
+// ------------------------
+// Small-case brute force + SAT
+//   For tiny benchmarks (e.g., case1), enumerate ALL legal bus-consistent mappings
+//   (including bit permutations and per-bit inversions), then SAT-check.
+//   This is meant to be a *simple* and *complete* solver for small instances.
+// ------------------------
+static inline uint64_t cappedMul(uint64_t a, uint64_t b, uint64_t cap) {
+    if (a == 0 || b == 0) return 0;
+    if (a > cap / b) return cap;
+    return a * b;
+}
+
+static inline uint64_t factU64(int n, uint64_t cap) {
+    uint64_t v = 1;
+    for (int i = 2; i <= n; ++i) {
+        v = cappedMul(v, (uint64_t)i, cap);
+        if (v >= cap) return cap;
+    }
+    return v;
+}
+
+static inline uint64_t pow2U64(int k, uint64_t cap) {
+    if (k <= 0) return 1;
+    uint64_t v = 1;
+    for (int i = 0; i < k; ++i) {
+        v = cappedMul(v, 2, cap);
+        if (v >= cap) return cap;
+    }
+    return v;
+}
+
+static bool isBruteforceSmallCaseFeasible(const UnateTable& t1,
+                                         const UnateTable& t2,
+                                         const std::vector<PortBusGroup>& inB1,
+                                         const std::vector<PortBusGroup>& inB2,
+                                         const std::vector<int>& inNon1,
+                                         const std::vector<int>& inNon2,
+                                         const std::vector<PortBusGroup>& outB1,
+                                         const std::vector<PortBusGroup>& outB2,
+                                         const std::vector<int>& outNon1,
+                                         const std::vector<int>& outNon2,
+                                         uint64_t& estCombos) {
+    // Hard requirement for completeness with our brute strategy:
+    // - same number of PIs and POs
+    // - same number of non-bus ports (so we can enumerate bijections)
+    // - bus counts already matched before calling this
+    if (t1.nPO != t2.nPO) return false;
+    if (t1.nPI != t2.nPI) return false;
+    if (inNon1.size() != inNon2.size()) return false;
+    if (outNon1.size() != outNon2.size()) return false;
+
+    // Require width multisets to match for input/output buses.
+    auto widths = [](const std::vector<PortBusGroup>& g) {
+        std::vector<int> w;
+        w.reserve(g.size());
+        for (const auto& x : g) w.push_back((int)x.portIdx.size());
+        std::sort(w.begin(), w.end());
+        return w;
+    };
+    if (widths(inB1) != widths(inB2)) return false;
+    if (widths(outB1) != widths(outB2)) return false;
+
+    // Estimate total combos (cap at kCap+1).
+    const uint64_t kCap = 300000; // keeps SAT calls bounded
+    uint64_t cap = kCap + 1;
+
+    auto busPart = [&](const std::vector<PortBusGroup>& g) -> uint64_t {
+        uint64_t ways = factU64((int)g.size(), cap);
+        for (const auto& bg : g) {
+            const int w = (int)bg.portIdx.size();
+            ways = cappedMul(ways, factU64(w, cap), cap);
+            ways = cappedMul(ways, pow2U64(w, cap), cap);
+            if (ways >= cap) return cap;
+        }
+        return ways;
+    };
+
+    uint64_t inWays  = busPart(inB2);
+    inWays = cappedMul(inWays, factU64((int)inNon2.size(), cap), cap);
+    inWays = cappedMul(inWays, pow2U64((int)inNon2.size(), cap), cap);
+
+    uint64_t outWays = busPart(outB2);
+    outWays = cappedMul(outWays, factU64((int)outNon2.size(), cap), cap);
+    outWays = cappedMul(outWays, pow2U64((int)outNon2.size(), cap), cap);
+
+    estCombos = cappedMul(inWays, outWays, cap);
+    if (estCombos > kCap) return false;
+    return true;
+}
+
+static MatchResult solveSmallCaseBruteforceSAT(const Circuit& c1,
+                                              const Circuit& c2,
+                                              const UnateTable& t1,
+                                              const UnateTable& t2,
+                                              const std::vector<PortBusGroup>& inB1,
+                                              const std::vector<PortBusGroup>& inB2,
+                                              const std::vector<int>& inNon1,
+                                              const std::vector<int>& inNon2,
+                                              const std::vector<PortBusGroup>& outB1,
+                                              const std::vector<PortBusGroup>& outB2,
+                                              const std::vector<int>& outNon1,
+                                              const std::vector<int>& outNon2,
+                                              uint64_t estCombos) {
+    MatchResult best;
+    best.success = false;
+    best.msg = "Small-case brute: exhausted all mappings (no SAT-UNSAT found).";
+
+    std::vector<int>  piMap(t2.nPI, -1);
+    std::vector<char> piFlip(t2.nPI, 0);
+    std::vector<char> piConstOne(t2.nPI, 0);
+
+    std::vector<int>  poMap(t2.nPO, -1);
+    std::vector<char> rowFlip(t2.nPO, 0);
+
+    uint64_t tried = 0;
+    const uint64_t kLogEvery = 2000;
+
+    auto trySAT = [&]() -> bool {
+        MatchResult g = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip, piConstOne);
+        SatCheckResult satRes = checkMatchBySAT(c1, c2, g);
+        tried++;
+        if (tried % kLogEvery == 0) {
+            std::cerr << "[SmallCase] tried=" << tried;
+            if (estCombos) std::cerr << "/" << estCombos;
+            std::cerr << " lastBadPo=(" << satRes.badPoC1 << "," << satRes.badPoC2 << ")\n";
+        }
+        if (satRes.success) {
+            g.success = true;
+            g.msg = "Small-case brute SAT success (tried=" + std::to_string(tried) + ")";
+            best = g;
+            return true;
+        }
+        return false;
+    };
+
+    // ---- Enumerate OUTPUT mappings, given fixed INPUT mapping
+    auto enumOutputAll = [&](auto&& self) -> bool {
+        const int nBus = (int)outB2.size();
+        std::vector<int> permBus(nBus);
+        std::iota(permBus.begin(), permBus.end(), 0);
+        if (!permBus.empty()) std::sort(permBus.begin(), permBus.end());
+
+        do {
+            bool widthOk = true;
+            for (int i = 0; i < nBus; ++i) {
+                if (outB2[i].portIdx.size() != outB1[permBus[i]].portIdx.size()) { widthOk = false; break; }
+            }
+            if (!widthOk) continue;
+
+            // recurse bus-by-bus for bit permutations / inversions
+            std::function<bool(int)> recBus;
+            recBus = [&](int bi) -> bool {
+                if (bi == nBus) {
+                    // non-bus outputs: bijection + inversion
+                    std::vector<int> p1 = outNon1;
+                    std::sort(p1.begin(), p1.end());
+                    do {
+                        const int nN = (int)outNon2.size();
+                        const uint64_t mlim = (nN >= 63) ? 0 : (1ULL << nN);
+                        const uint64_t masks = (nN == 0) ? 1ULL : mlim;
+                        for (uint64_t m = 0; m < masks; ++m) {
+                            for (int k = 0; k < nN; ++k) {
+                                int po2 = outNon2[k];
+                                int po1 = p1[k];
+                                poMap[po2] = po1;
+                                rowFlip[po2] = (char)((m >> k) & 1ULL);
+                            }
+                            if (trySAT()) return true;
+                        }
+                    } while (std::next_permutation(p1.begin(), p1.end()));
+                    // cleanup non-bus
+                    for (int po2 : outNon2) { poMap[po2] = -1; rowFlip[po2] = 0; }
+                    return false;
+                }
+
+                const auto& g2 = outB2[bi];
+                const auto& g1 = outB1[permBus[bi]];
+                const int w = (int)g2.portIdx.size();
+
+                std::vector<int> bits1 = g1.portIdx;
+                std::sort(bits1.begin(), bits1.end());
+                do {
+                    const uint64_t masks = (w == 0) ? 1ULL : (1ULL << w);
+                    for (uint64_t m = 0; m < masks; ++m) {
+                        for (int k = 0; k < w; ++k) {
+                            int po2 = g2.portIdx[k];
+                            int po1 = bits1[k];
+                            poMap[po2] = po1;
+                            rowFlip[po2] = (char)((m >> k) & 1ULL);
+                        }
+                        if (recBus(bi + 1)) return true;
+                    }
+                } while (std::next_permutation(bits1.begin(), bits1.end()));
+
+                // cleanup this bus
+                for (int po2 : g2.portIdx) { poMap[po2] = -1; rowFlip[po2] = 0; }
+                return false;
+            };
+
+            if (recBus(0)) return true;
+        } while (std::next_permutation(permBus.begin(), permBus.end()));
+
+        return false;
+    };
+
+    // ---- Enumerate INPUT mappings
+    const int nBusIn = (int)inB2.size();
+    std::vector<int> permIn(nBusIn);
+    std::iota(permIn.begin(), permIn.end(), 0);
+    if (!permIn.empty()) std::sort(permIn.begin(), permIn.end());
+
+    do {
+        bool widthOk = true;
+        for (int i = 0; i < nBusIn; ++i) {
+            if (inB2[i].portIdx.size() != inB1[permIn[i]].portIdx.size()) { widthOk = false; break; }
+        }
+        if (!widthOk) continue;
+
+        std::function<bool(int)> recInBus;
+        recInBus = [&](int bi) -> bool {
+            if (bi == nBusIn) {
+                // non-bus inputs: bijection + inversion
+                std::vector<int> p1 = inNon1;
+                std::sort(p1.begin(), p1.end());
+                do {
+                    const int nN = (int)inNon2.size();
+                    const uint64_t masks = (nN == 0) ? 1ULL : (1ULL << nN);
+                    for (uint64_t m = 0; m < masks; ++m) {
+                        for (int k = 0; k < nN; ++k) {
+                            int pi2 = inNon2[k];
+                            int pi1 = p1[k];
+                            piMap[pi2] = pi1;
+                            piFlip[pi2] = (char)((m >> k) & 1ULL);
+                        }
+                        if (enumOutputAll(enumOutputAll)) return true;
+                    }
+                } while (std::next_permutation(p1.begin(), p1.end()));
+                // cleanup non-bus
+                for (int pi2 : inNon2) { piMap[pi2] = -1; piFlip[pi2] = 0; }
+                return false;
+            }
+
+            const auto& g2 = inB2[bi];
+            const auto& g1 = inB1[permIn[bi]];
+            const int w = (int)g2.portIdx.size();
+
+            std::vector<int> bits1 = g1.portIdx;
+            std::sort(bits1.begin(), bits1.end());
+            do {
+                const uint64_t masks = (w == 0) ? 1ULL : (1ULL << w);
+                for (uint64_t m = 0; m < masks; ++m) {
+                    for (int k = 0; k < w; ++k) {
+                        int pi2 = g2.portIdx[k];
+                        int pi1 = bits1[k];
+                        piMap[pi2] = pi1;
+                        piFlip[pi2] = (char)((m >> k) & 1ULL);
+                    }
+                    if (recInBus(bi + 1)) return true;
+                }
+            } while (std::next_permutation(bits1.begin(), bits1.end()));
+
+            // cleanup this bus
+            for (int pi2 : g2.portIdx) { piMap[pi2] = -1; piFlip[pi2] = 0; }
+            return false;
+        };
+
+        if (recInBus(0)) return best; // found
+    } while (std::next_permutation(permIn.begin(), permIn.end()));
+
+    // If we reach here, nothing worked.
+    best.success = false;
+    best.msg = "Small-case brute: exhausted all mappings (tried=" + std::to_string(tried) + ")";
+    return best;
+}
+
+// ------------------------
+// Timeout fallback: build a *very fast* guess without witness/SAT.
+// Uses bus-only allowed sets + (I,B,U) nearest-neighbor style scoring.
+// ------------------------
+static MatchResult makeIBUQuickGuessFromAllowed(const UnateTable& t1,
+                                               const UnateTable& t2,
+                                               const std::vector<std::vector<int>>& allowedPo1,
+                                               const std::vector<std::vector<int>>& allowedPi1,
+                                               std::mt19937& rng) {
+    const int nPO = t2.nPO;
+    const int nPI2 = t2.nPI;
+
+    // (1) PO mapping: perfect matching with candidates ordered by row (I,B,U).
+    std::vector<std::array<int,3>> poIBU1(t1.nPO), poIBU2(t2.nPO);
+    for (int i = 0; i < t1.nPO; ++i) poIBU1[i] = rowIBU(t1, i);
+    for (int i = 0; i < t2.nPO; ++i) poIBU2[i] = rowIBU(t2, i);
+
+    std::vector<int> poMap(nPO, -1);
+    std::vector<char> rowFlip(nPO, 0); // keep polarity neutral in fallback
+
+    auto buildAdjPO = [&](int cap, std::vector<std::vector<int>>& adj) {
+        adj.assign(nPO, {});
+        std::uniform_int_distribution<int> tie(0, 0x7fffffff);
+        for (int po2 = 0; po2 < nPO; ++po2) {
+            const auto& cand = allowedPo1[po2];
+            std::vector<std::pair<int,int>> scored;
+            scored.reserve(cand.size());
+            for (int po1 : cand) {
+                int d = l1Dist3(poIBU1[po1], poIBU2[po2]);
+                d = d * 1024 + (tie(rng) & 1023); // random tie-break
+                scored.push_back({d, po1});
+            }
+            if (scored.empty()) continue;
+            if (cap > 0 && (int)scored.size() > cap) {
+                std::nth_element(scored.begin(), scored.begin() + cap, scored.end(),
+                                 [](const auto& a, const auto& b){ return a.first < b.first; });
+                scored.resize(cap);
+            }
+            std::sort(scored.begin(), scored.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+            adj[po2].reserve(scored.size());
+            for (auto& it : scored) adj[po2].push_back(it.second);
+        }
+    };
+
+    std::vector<std::vector<int>> adjPO;
+    bool okPO = false;
+    const int caps[] = {4, 8, 16, 32, 64, 0}; // 0 => full
+    for (int cap0 : caps) {
+        int cap = cap0;
+        if (cap == 0) cap = 1000000000; // effectively no cap
+        buildAdjPO(cap, adjPO);
+        if (hopcroftKarp(adjPO, t1.nPO, poMap)) { okPO = true; break; }
+    }
+
+    if (!okPO) {
+        // Last resort: greedy permutation (still attempts to respect allowed sets).
+        std::vector<char> used(t1.nPO, 0);
+        for (int po2 = 0; po2 < nPO; ++po2) {
+            int pick = -1;
+            int bestD = 1000000000;
+            for (int po1 : allowedPo1[po2]) {
+                if (used[po1]) continue;
+                int d = l1Dist3(poIBU1[po1], poIBU2[po2]);
+                if (d < bestD) { bestD = d; pick = po1; }
+            }
+            if (pick < 0) {
+                for (int po1 = 0; po1 < t1.nPO; ++po1) if (!used[po1]) { pick = po1; break; }
+            }
+            if (pick < 0) pick = 0;
+            used[pick] = 1;
+            poMap[po2] = pick;
+        }
+    }
+
+    // (2) PI mapping (many-to-one allowed): nearest by column (I,B,U) within allowed set.
+    const auto piIBU1 = allColIBU(t1);
+    const auto piIBU2 = allColIBU(t2);
+
+    std::vector<int>  piMap(nPI2, -1);
+    std::vector<char> piFlip(nPI2, 0);
+    std::vector<char> piConstOne(nPI2, 0);
+
+    for (int pi2 = 0; pi2 < nPI2; ++pi2) {
+        const auto& cand = allowedPi1[pi2];
+        int bestPi1 = -1;
+        int bestD = 1000000000;
+        for (int pi1 : cand) {
+            int d = l1Dist3(piIBU1[pi1], piIBU2[pi2]);
+            if (d < bestD) { bestD = d; bestPi1 = pi1; }
+        }
+        piMap[pi2] = bestPi1;
+        // Random polarity: sometimes helps by chance; format legality unaffected.
+        piFlip[pi2] = (char)(rng() & 1);
+        if (bestPi1 < 0) {
+            // Shouldn't happen with bus-only allowed sets; tie to constant 0.
+            piFlip[pi2] = 0;
+            piConstOne[pi2] = 0;
+        }
+    }
+
+    return makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip, piConstOne);
 }
 
 // ------------------------
@@ -1325,6 +1772,82 @@ static vector<uint8_t> computePoBiasQuant(const Circuit& c,
     return q;
 }
 
+
+// Compute a PO signature: (bias + abs-correlation histogram vs. other POs).
+// abs-corr is estimated from random simulation: |P(eq) - P(neq)| = |1 - 2*P(neq)|.
+static std::vector<PoSig> computePoSigQuant(const Circuit& c,
+                                            const vector<int>& topo,
+                                            std::mt19937& rng,
+                                            int batches,
+                                            int bins) {
+    const int nPO = (int)c.POs.size();
+    const int nPI = (int)c.PIs.size();
+    if (nPO == 0) return {};
+
+    batches = std::max(1, batches);
+    bins = std::max(4, bins);
+
+    std::vector<std::vector<uint64_t>> outBits(nPO, std::vector<uint64_t>(batches, 0));
+    std::vector<uint32_t> ones(nPO, 0);
+
+    std::uniform_int_distribution<uint64_t> dist(0, ~0ull);
+    std::vector<uint64_t> piMask(nPI);
+
+    for (int b = 0; b < batches; ++b) {
+        for (int i = 0; i < nPI; ++i) piMask[i] = dist(rng);
+        std::vector<uint64_t> out = simulateCircuit64(c, topo, piMask, c.POs);
+        for (int po = 0; po < nPO; ++po) {
+            outBits[po][b] = out[po];
+            ones[po] += (uint32_t)__builtin_popcountll(out[po]);
+        }
+    }
+
+    const int totalBits = 64 * batches;
+
+    std::vector<PoSig> sig(nPO);
+    for (int po = 0; po < nPO; ++po) {
+        int q = (int)(((uint64_t)ones[po] * 255ull + (uint64_t)totalBits / 2ull) / (uint64_t)totalBits);
+        if (q < 0) q = 0;
+        if (q > 255) q = 255;
+        sig[po].bias = (uint8_t)q;
+        sig[po].absCorrHist.assign((size_t)bins, 0);
+    }
+
+    if (nPO <= 1) return sig;
+
+    std::vector<std::vector<int>> histCnt(nPO, std::vector<int>(bins, 0));
+    for (int i = 0; i < nPO; ++i) {
+        for (int j = 0; j < nPO; ++j) {
+            if (i == j) continue;
+            int diff = 0;
+            for (int b = 0; b < batches; ++b) {
+                diff += __builtin_popcountll(outBits[i][b] ^ outBits[j][b]);
+            }
+            long long d = (long long)totalBits - 2LL * (long long)diff;
+            if (d < 0) d = -d;
+            int absQ = (int)((d * 255LL) / (long long)totalBits);
+            if (absQ < 0) absQ = 0;
+            if (absQ > 255) absQ = 255;
+            int bin = (absQ * bins) >> 8; // /256
+            if (bin >= bins) bin = bins - 1;
+            histCnt[i][bin] += 1;
+        }
+    }
+
+    for (int i = 0; i < nPO; ++i) {
+        for (int k = 0; k < bins; ++k) {
+            int q = (int)(((long long)histCnt[i][k] * 255LL + (long long)(nPO - 1) / 2LL) / (long long)(nPO - 1));
+            if (q < 0) q = 0;
+            if (q > 255) q = 255;
+            sig[i].absCorrHist[k] = (uint8_t)q;
+        }
+    }
+
+    return sig;
+}
+
+
+
  
 
 // Fast randomized simulation filter:
@@ -1471,12 +1994,29 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
                              int maxCegisIters,
                              int poTries,
                              int piTriesPerPO,
-                             int seed) {
+                             int seed,
+                             int timeoutSwitchSeconds) {
     // If caller keeps the default (often 1), we can get "combo=1/1" and
     // be stuck exploring a wrong bus-to-bus mapping forever. Since the number
     // of buses is typically small, multi-sampling bus matchings is cheap and
     // significantly increases robustness.
     if (busSamples < 60) busSamples = 60;
+    const auto tStartAll = std::chrono::steady_clock::now();
+    auto elapsedSec = [&]() -> double {
+        using namespace std::chrono;
+        return duration_cast<duration<double>>(steady_clock::now() - tStartAll).count();
+    };
+    auto timeoutReached = [&]() -> bool {
+        if (timeoutSwitchSeconds <= 0) return false;
+        return elapsedSec() >= (double)timeoutSwitchSeconds;
+    };
+    // Avoid starting SAT too close to the deadline (SAT may run long).
+    const int kSatSafetyMarginSec = 60;
+    auto timeoutPreSat = [&]() -> bool {
+        if (timeoutSwitchSeconds <= 0) return false;
+        return elapsedSec() >= (double)(timeoutSwitchSeconds - kSatSafetyMarginSec);
+    };
+    bool timeoutTriggered = false;
 
     MatchResult best;
     best.success = false;
@@ -1515,8 +2055,21 @@ MatchResult solveByUnateCEGIS(const Circuit& c1,
     std::mt19937 rng((seed == 0) ? std::random_device{}() : (unsigned)seed);
 
 std::mt19937 rngBias = rng;
-const vector<uint8_t> poBias1 = computePoBiasQuant(c1, topo1, rngBias, 16);
-const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
+
+// PO signature (bias + absCorr histogram) for pruning / tie-break.
+std::mt19937 rngPoSig = rng;
+const int kPoSigBatches = 4;   // 4*64=256 random patterns
+const int kPoSigBins    = 16;
+const vector<PoSig> poSig1 = computePoSigQuant(c1, topo1, rngPoSig, kPoSigBatches, kPoSigBins);
+const vector<PoSig> poSig2 = computePoSigQuant(c2, topo2, rngPoSig, kPoSigBatches, kPoSigBins);
+
+vector<uint8_t> poBias1, poBias2;
+poBias1.reserve((size_t)nPO);
+poBias2.reserve((size_t)nPO);
+for (int i = 0; i < nPO; ++i) {
+    poBias1.push_back(i < (int)poSig1.size() ? poSig1[i].bias : 0);
+    poBias2.push_back(i < (int)poSig2.size() ? poSig2[i].bias : 0);
+}
 
     // Influence signatures: coarse (T=256) for PO-permutation-invariant pruning,
     // and fine (T=512) for PO-aligned pruning after we obtain a PO mapping.
@@ -1554,6 +2107,21 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                    std::to_string(outB1.size()) + " c2=" + std::to_string(outB2.size()) + ")";
         return best;
     }
+
+
+    // ------------------------
+    // Small-case fast path: brute-force ALL legal mappings then SAT-check.
+    // Intended for very small benchmarks (e.g., case1). No witness/reject logic.
+    // ------------------------
+    {
+        uint64_t estCombos = 0;
+        if (isBruteforceSmallCaseFeasible(t1, t2, inB1, inB2, inNon1, inNon2, outB1, outB2, outNon1, outNon2, estCombos)) {
+            std::cerr << "[SmallCase] enabled: estimated combos=" << estCombos << " (<=300000)\n";
+            MatchResult r = solveSmallCaseBruteforceSAT(c1, c2, t1, t2, inB1, inB2, inNon1, inNon2, outB1, outB2, outNon1, outNon2, estCombos);
+            return r;
+        }
+    }
+
 
     // Note: PI counts can differ. Extra circuit-II inputs are allowed and can be mapped
     // many-to-one onto circuit-I inputs (or even constants). Therefore, we do NOT require
@@ -1639,7 +2207,7 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
     uint64_t buildPiFail = 0;
     uint64_t randPiFail = 0;
     uint64_t triesTotal = 0;
-    auto tGlobalStart = std::chrono::steady_clock::now();
+    auto tGlobalStart = tStartAll;
     auto tLastLog = tGlobalStart;
 
     MatchResult lastTried;
@@ -1679,6 +2247,15 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
             continue;
         }
 
+        // Keep a bus-only copy for timeout fallback (no extra pruning).
+        auto allowedPiBusOnly = allowedPi1;
+
+        if (timeoutReached()) {
+            MatchResult r = makeIBUQuickGuessFromAllowed(t1, t2, allowedPo1, allowedPiBusOnly, rng);
+            r.msg = "[TIMEOUT] switch@" + std::to_string(timeoutSwitchSeconds) + "s: output quick IBU guess (no witness/SAT).";
+            return r;
+        }
+
         // Hard prune PI candidates by inversion-invariant column signature.
         // (P/N merged into U) => safe under input negation.
         for (int pi2 = 0; pi2 < nPI2; ++pi2) {
@@ -1698,9 +2275,16 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
         coarsePrunePiAllowed(inflFeat1, inflFeat2, kInfluenceTopK, allowedPi1);
 
         // Build PO ordering (restricted by bus)
-        vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, rng);
+        vector<vector<int>> poOrd = buildPOCandidateOrder(t1, t2, allowedPo1, poSig1, poSig2, 16, rng);
 
         auto tryOneGuess = [&](int Kpo) -> bool {
+            if (timeoutReached()) {
+                timeoutTriggered = true;
+                MatchResult r = makeIBUQuickGuessFromAllowed(t1, t2, allowedPo1, allowedPiBusOnly, rng);
+                r.msg = "[TIMEOUT] switch@" + std::to_string(timeoutSwitchSeconds) + "s: output quick IBU guess (no witness/SAT).";
+                best = r;
+                return true;
+            }
             vector<vector<int>> adjPO(nPO);
             for (int po2 = 0; po2 < nPO; po2++) {
                 int k = std::min(Kpo, (int)poOrd[po2].size());
@@ -1764,9 +2348,15 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
 
 	                    MatchResult guess = makeGuessFromMaps(t1, t2, poMap, rowFlip, piMap, piFlip, piConstOne);
 	                    lastTried = guess;
-
-	                    triesTotal++;
-	                    triesCombo++;
+                        triesTotal++;
+                        triesCombo++;
+                        if (timeoutReached()) {
+                            timeoutTriggered = true;
+                            MatchResult r = makeIBUQuickGuessFromAllowed(t1, t2, allowedPo1, allowedPiBusOnly, rng);
+                            r.msg = "[TIMEOUT] switch@" + std::to_string(timeoutSwitchSeconds) + "s: output quick IBU guess (no witness/SAT).";
+                            best = r;
+                            return true;
+                        }
                 {
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - tLastLog).count() >= 1) {
@@ -1801,8 +2391,15 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
 	                        simReject++;
 	                        continue;
 	                    }
+                        if (timeoutPreSat()) {
+                            timeoutTriggered = true;
+                            MatchResult r = makeIBUQuickGuessFromAllowed(t1, t2, allowedPo1, allowedPiBusOnly, rng);
+                            r.msg = "[TIMEOUT] nearing deadline: skip SAT and output quick IBU guess.";
+                            best = r;
+                            return true;
+                        }
 
-	                    satCalls++;
+                        satCalls++;
                 {
                     using namespace std::chrono;
                     auto now = steady_clock::now();
@@ -1864,6 +2461,10 @@ const vector<uint8_t> poBias2 = computePoBiasQuant(c2, topo2, rngBias, 16);
                     curIt = it;
                     curKpo = Kpo;
                     if (tryOneGuess(Kpo)) {
+                        if (timeoutTriggered) {
+                            std::cerr << "[TIMEOUT] quick-guess emitted at t=" << elapsedSec() << "s\n";
+                            return best;
+                        }
                         std::cerr << "[UnateBus] success=true  PI=" << nPI2 << "/" << nPI2
                                   << " (c1PI=" << nPI1 << ")"
                                   << "  PO=" << nPO << "/" << nPO

@@ -18,25 +18,6 @@ static std::string resolveRelativeTo(const std::string& baseFile, const std::str
     return p.string();
 }
 
-// NEW: prefer *_simp.v if exists
-static std::string preferSimpVerilog(const std::string& pathStr) {
-    fs::path p(pathStr);
-
-    // already simp
-    std::string fn = p.filename().string();
-    if (fn.size() >= 7 && fn.find("_simp.v") != std::string::npos) return pathStr;
-
-    // only handle .v
-    if (p.extension() != ".v") return pathStr;
-
-    // try "<stem>_simp.v"
-    fs::path simp = p.parent_path() / (p.stem().string() + "_simp.v");
-    if (fs::exists(simp)) return simp.string();
-
-    // otherwise keep original
-    return pathStr;
-}
-
 static std::string pickUnateCsv(const std::string& inputFile, const std::string& fileName) {
     fs::path baseDir = fs::path(inputFile).parent_path();
     if (!baseDir.empty()) {
@@ -55,17 +36,13 @@ int main(int argc, char** argv) {
     }
 
     const std::string inputFile = argv[1];
-    // const std::string outMatchFile = argv[2];
+    const std::string outMatchFile = argv[2];
 
     try {
         ProblemInput in = parseProblemInputFile(inputFile);
 
-        std::string c1Path = resolveRelativeTo(inputFile, in.c1File);
-        std::string c2Path = resolveRelativeTo(inputFile, in.c2File);
-
-        // NEW: auto switch to *_simp.v if present
-        c1Path = preferSimpVerilog(c1Path);
-        c2Path = preferSimpVerilog(c2Path);
+        const std::string c1Path = resolveRelativeTo(inputFile, in.c1File);
+        const std::string c2Path = resolveRelativeTo(inputFile, in.c2File);
 
         Circuit c1 = parseVerilogNetlist(c1Path);
         Circuit c2 = parseVerilogNetlist(c2Path);
@@ -96,22 +73,7 @@ int main(int argc, char** argv) {
                   << "  PO=" << res.poPairs.size() << "/" << c1.POs.size() << "\n";
         std::cerr << "[UnateCEGIS] msg: " << res.msg << "\n";
 
-        fs::path inputPath = fs::path(inputFile);
-        fs::path outPath;
-
-        // 如果 argv[2] 本身是絕對路徑，就尊重它
-        fs::path userOut(argv[2]);
-        if (userOut.is_absolute()) {
-            outPath = userOut;
-        } else {
-            // 一律寫到 input 所在資料夾
-            outPath = inputPath.parent_path() / userOut;
-        }
-
-        writeMatchFile(outPath.string(), c1, c2, res);
-
-        std::cerr << "[INFO] output written to: " << outPath << "\n";
-
+        writeMatchFile(outMatchFile, c1, c2, res);
         return res.success ? 0 : 2;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

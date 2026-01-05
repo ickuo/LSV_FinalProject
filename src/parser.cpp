@@ -662,13 +662,12 @@ BusInfo attachBuses(const Circuit& c, const vector<vector<string>>& busNames) {
             int nid = it->second;
             b.members.push_back(nid);
 
-            if (bi.netToBus[nid] != -1 && bi.netToBus[nid] != i) {
-                // 只禁止：同一個 net 出現在不同 bus
+            if (bi.netToBus[nid] != -1) {
+                // one net appears in multiple buses: usually not allowed/meaningful
+                // but you can decide to allow; here we treat as error
                 throw runtime_error("Net '" + nm + "' appears in multiple buses.");
             }
-            // 允許：同一個 bus 內重複出現（例如 n794 在同 bus 的兩個 bit）
             bi.netToBus[nid] = i;
-
         }
         bi.buses.push_back(std::move(b));
     }
