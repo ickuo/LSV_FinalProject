@@ -662,9 +662,8 @@ BusInfo attachBuses(const Circuit& c, const vector<vector<string>>& busNames) {
             int nid = it->second;
             b.members.push_back(nid);
 
-            if (bi.netToBus[nid] != -1) {
-                // one net appears in multiple buses: usually not allowed/meaningful
-                // but you can decide to allow; here we treat as error
+            if (bi.netToBus[nid] != -1 && bi.netToBus[nid] != i) {
+                // 只禁止：同一個 net 出現在不同 bus
                 throw runtime_error("Net '" + nm + "' appears in multiple buses.");
             }
             bi.netToBus[nid] = i;
